@@ -14,8 +14,7 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
-#include <unordered_set>
-#include <excpt.h>  // for SEH
+#include <excpt.h>
 
 namespace redstone_optimizer {
 
@@ -75,7 +74,6 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
     for (const auto& item : sources->mComponents) {
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
-        // 移除 typeid，仅使用数据
         int strength = source->getStrength();
         hash = hash * 31 + strength;
         hash = hash * 31 + item.mDampening;
@@ -84,6 +82,16 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
         hash = hash * 31 + item.mData;
     }
     return hash;
+}
+
+// 尝试计算哈希，如果崩溃返回 false
+bool tryComputeHash(ConsumerComponent* comp, uint64_t& outHash) {
+    __try {
+        outHash = computeInputHash(comp);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 void startDebugTask() {
@@ -146,79 +154,66 @@ LL_TYPE_INSTANCE_HOOK(
     CircuitSystem& system,
     BlockPos const& pos
 ) {
-    // 使用 SEH 保护可能崩溃的代码段（如访问无效 this）
-    uint64_t currentHash = 0;
-    bool hashComputed = false;
-
-    __try {
-        ++evaluateDepth;
-        if (evaluateDepth > MAX_EVALUATE_DEPTH) {
-            bool result = origin(system, pos);
-            --evaluateDepth;
-            return result;
-        }
-
-        if (!getConfig().enabled) {
-            ++cacheSkipCount;
-            bool result = origin(system, pos);
-            --evaluateDepth;
-            return result;
-        }
-
-        // 计算哈希（可能因无效 this 崩溃）
-        currentHash = computeInputHash(this);
-        hashComputed = true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        // 发生结构化异常（如访问违例），直接回退到原版
+    ++evaluateDepth;
+    if (evaluateDepth > MAX_EVALUATE_DEPTH) {
+        bool result = origin(system, pos);
         --evaluateDepth;
-        return origin(system, pos);
+        return result;
     }
 
-    // 如果成功计算哈希，说明 this 至少可安全访问，继续缓存逻辑
-    if (hashComputed) {
-        // 缓存操作需要加锁（这里会有对象析构，但已在 SEH 块外）
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = getCache().find(this);
+    if (!getConfig().enabled) {
+        ++cacheSkipCount;
+        bool result = origin(system, pos);
+        --evaluateDepth;
+        return result;
+    }
 
-        if (it != getCache().end() && it->second.inputHash == currentHash) {
-            int oldStrength = this->getStrength();
-            int cachedStrength = it->second.lastOutputStrength;
+    uint64_t currentHash = 0;
+    if (!tryComputeHash(this, currentHash)) {
+        // 计算哈希时崩溃，直接回退
+        bool result = origin(system, pos);
+        --evaluateDepth;
+        return result;
+    }
 
-            if (oldStrength != cachedStrength) {
-                this->setStrength(cachedStrength);
-                if (getConfig().debug) {
-                    logger().debug("Cache hit & updated at ({},{},{})", pos.x, pos.y, pos.z);
-                }
-                ++cacheHitCount;
-                --evaluateDepth;
-                return true;
-            } else {
-                if (getConfig().debug) {
-                    logger().debug("Cache hit (no change) at ({},{},{})", pos.x, pos.y, pos.z);
-                }
-                ++cacheHitCount;
-                --evaluateDepth;
-                return false;
-            }
-        } else {
-            bool result = origin(system, pos);
-            getCache()[this] = CacheEntry{
-                .inputHash = currentHash,
-                .lastOutputStrength = this->getStrength(),
-                .lastUpdateTick = getCurrentTickID()
-            };
+    // 到这里说明 this 至少可以安全访问，继续缓存逻辑
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto it = getCache().find(this);
+
+    if (it != getCache().end() && it->second.inputHash == currentHash) {
+        int oldStrength = this->getStrength();
+        int cachedStrength = it->second.lastOutputStrength;
+
+        if (oldStrength != cachedStrength) {
+            this->setStrength(cachedStrength);
             if (getConfig().debug) {
-                logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
+                logger().debug("Cache hit & updated at ({},{},{})", pos.x, pos.y, pos.z);
             }
-            ++cacheMissCount;
+            ++cacheHitCount;
             --evaluateDepth;
-            return result;
+            return true;
+        } else {
+            if (getConfig().debug) {
+                logger().debug("Cache hit (no change) at ({},{},{})", pos.x, pos.y, pos.z);
+            }
+            ++cacheHitCount;
+            --evaluateDepth;
+            return false;
         }
+    } else {
+        bool result = origin(system, pos);
+        getCache()[this] = CacheEntry{
+            .inputHash = currentHash,
+            .lastOutputStrength = this->getStrength(),
+            .lastUpdateTick = getCurrentTickID()
+        };
+        if (getConfig().debug) {
+            logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
+        }
+        ++cacheMissCount;
+        --evaluateDepth;
+        return result;
     }
-
-    // 理论上不会执行到这里，但为安全起见调用原版
-    --evaluateDepth;
-    return origin(system, pos);
 }
 
 LL_TYPE_INSTANCE_HOOK(
