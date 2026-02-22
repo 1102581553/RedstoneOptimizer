@@ -13,6 +13,7 @@
 #include <mc/world/redstone/circuit/components/CapacitorComponent.h>
 #include <algorithm>
 #include <filesystem>
+#include <mc/world/redstone/circuit/components/CapacitorComponent.h>
 
 namespace redstone_optimizer {
 
@@ -50,9 +51,7 @@ uint64_t getCurrentTickID() {
 }
 
 bool hasInternalTimer(BaseCircuitComponent* comp) {
-    // TODO: 根据实际枚举值调整
-    (void)comp; // 消除未使用参数警告
-    return false;
+    return dynamic_cast<CapacitorComponent*>(comp) != nullptr;
 }
 
 uint64_t computeInputHash(ConsumerComponent* comp) {
