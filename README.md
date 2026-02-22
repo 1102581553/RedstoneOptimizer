@@ -10,6 +10,8 @@
 - **有序更新**：将原版随机顺序的 C-tick 更新改为按位置排序（先 x 轴，再 z 轴，最后 y 轴），消除红石行为的随机性。
 - **输入缓存**：对于输入信号未发生变化的非时序元件（如红石线、红石灯等），直接复用上次输出，避免重复计算，降低 CPU 开销。
 - **时序元件兼容**：对于中继器、比较器等含有内部延迟的元件，插件会自动跳过缓存，保持原版行为，确保电路逻辑正确。
+- **可配置开关**：可通过配置文件开启/关闭优化功能，便于对比测试。
+- **调试模式**：启用调试模式后，插件会输出缓存命中统计等信息，帮助分析优化效果。
 
 ## 📥 安装
 
@@ -17,48 +19,4 @@
 1. 确保已安装 [lip](https://github.com/LiteLDev/lip) 包管理器。
 2. 在服务器根目录运行以下命令：
    ```bash
-   lip install https://github.com/1102581553/RedstoneOptimizer
-   ```
-
-### 手动安装
-1. 从 [Releases](https://github.com/1102581553/RedstoneOptimizer/releases) 下载最新版本的 `RedstoneOptimizer-windows-x64.zip`。
-2. 解压后将 `RedstoneOptimizer.dll` 和 `manifest.json` 放入服务器的 `plugins/RedstoneOptimizer/` 目录（如无该目录请自行创建）。
-3. 重启服务器。
-
-## 🚀 使用
-
-插件加载后自动生效，无需任何配置命令。您只需照常建造红石电路，即可感受到性能提升和更稳定的行为。
-
-> **注意**：由于更新顺序的改变，某些依赖随机性（如使用乱序红石作为随机数发生器）的设计可能会受到影响。请根据实际需求调整。
-
-## ⚙️ 编译
-
-如果您希望自行从源码构建，请确保满足以下环境：
-- [xmake](https://xmake.io) 构建工具
-- Visual Studio 2022（Windows）或 GCC 11+（Linux）
-- LeviLamina 1.9.x 开发环境
-
-1. 克隆仓库：
-   ```bash
-   git clone https://github.com/1102581553/RedstoneOptimizer.git
-   cd RedstoneOptimizer
-   ```
-2. 修改 `xmake.lua` 中的 LeviLamina 依赖版本（若需要）。
-3. 构建：
-   ```bash
-   xmake config -m release
-   xmake
-   ```
-4. 生成的插件位于 `bin/RedstoneOptimizer.dll`。
-
-## 📄 许可证
-
-本项目采用 [CC0 1.0 通用](LICENSE) 许可证，您可自由使用、修改和分发。
-
-## 🤝 贡献
-
-欢迎提交 Issue 或 Pull Request 来帮助改进插件。
-
----
-
-**RedstoneOptimizer** —— 让您的红石电路更加流畅、可预测！
+   lip install github.com/1102581553/RedstoneOptimizer
