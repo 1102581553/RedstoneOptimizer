@@ -15,13 +15,18 @@
 #include <atomic>
 #include <mutex>
 #include <excpt.h>
+#include <list>          // 新增
 
 namespace redstone_optimizer {
 
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
-static std::unordered_map<void*, CacheEntry> cache;
+
+// LRU 缓存结构
+static std::list<void*> lruList;                                   // 链表头部最新，尾部最旧
+static std::unordered_map<void*, std::pair<CacheEntry, std::list<void*>::iterator>> cacheMap; // 键 -> (条目, 链表迭代器)
 static std::mutex cacheMutex;
+
 static bool hookInstalled = false;
 static std::atomic<bool> debugTaskRunning = false;
 
@@ -34,16 +39,20 @@ constexpr int MAX_EVALUATE_DEPTH = 500;
 
 Config& getConfig() { return config; }
 
-std::unordered_map<void*, CacheEntry>& getCache() { return cache; }
-
 void clearCache() {
     std::lock_guard<std::mutex> lock(cacheMutex);
-    cache.clear();
+    lruList.clear();
+    cacheMap.clear();
 }
 
 bool loadConfig() {
     auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
-    return ll::config::loadConfig(config, path);
+    bool loaded = ll::config::loadConfig(config, path);
+    // 确保 maxCacheSize 有效
+    if (config.maxCacheSize == 0) {
+        config.maxCacheSize = 1000000;
+    }
+    return loaded;
 }
 
 bool saveConfig() {
@@ -64,7 +73,6 @@ uint64_t getCurrentTickID() {
     return level->getCurrentTick().tickID;
 }
 
-// 不再使用时序元件检测，所有 ConsumerComponent 都参与缓存
 // 仅使用数据计算哈希，避免 RTTI
 uint64_t computeInputHash(ConsumerComponent* comp) {
     uint64_t hash = 0;
@@ -106,7 +114,7 @@ void startDebugTask() {
                 std::lock_guard<std::mutex> lock(cacheMutex);
                 logger().info("Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
                               cacheHitCount.load(), cacheMissCount.load(), cacheSkipCount.load(),
-                              getCache().size(), hitRate);
+                              cacheMap.size(), hitRate);
             });
         }
         debugTaskRunning = false;
@@ -176,13 +184,16 @@ LL_TYPE_INSTANCE_HOOK(
         return result;
     }
 
-    // 到这里说明 this 至少可以安全访问，继续缓存逻辑
     std::lock_guard<std::mutex> lock(cacheMutex);
-    auto it = getCache().find(this);
 
-    if (it != getCache().end() && it->second.inputHash == currentHash) {
+    auto it = cacheMap.find(this);
+
+    if (it != cacheMap.end() && it->second.first.inputHash == currentHash) {
+        // 命中缓存：将对应节点移到链表头部（最近使用）
+        lruList.splice(lruList.begin(), lruList, it->second.second);
+
         int oldStrength = this->getStrength();
-        int cachedStrength = it->second.lastOutputStrength;
+        int cachedStrength = it->second.first.lastOutputStrength;
 
         if (oldStrength != cachedStrength) {
             this->setStrength(cachedStrength);
@@ -201,12 +212,29 @@ LL_TYPE_INSTANCE_HOOK(
             return false;
         }
     } else {
+        // 未命中：调用原函数，然后插入新缓存
         bool result = origin(system, pos);
-        getCache()[this] = CacheEntry{
-            .inputHash = currentHash,
-            .lastOutputStrength = this->getStrength(),
-            .lastUpdateTick = getCurrentTickID()
+
+        // 插入前检查是否需要淘汰最久未使用的条目
+        if (cacheMap.size() >= getConfig().maxCacheSize) {
+            // 淘汰链表尾部（最久未使用）
+            void* oldestKey = lruList.back();
+            cacheMap.erase(oldestKey);
+            lruList.pop_back();
+        }
+
+        // 在链表头部插入新键
+        lruList.push_front(this);
+        // 存储缓存条目及链表迭代器
+        cacheMap[this] = {
+            CacheEntry{
+                .inputHash = currentHash,
+                .lastOutputStrength = this->getStrength(),
+                .lastUpdateTick = getCurrentTickID()
+            },
+            lruList.begin()
         };
+
         if (getConfig().debug) {
             logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
         }
@@ -228,7 +256,14 @@ LL_TYPE_INSTANCE_HOOK(
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = this->mAllComponents.find(pos);
         if (it != this->mAllComponents.end()) {
-            getCache().erase(it->second.get());
+            void* compPtr = it->second.get();
+            auto cacheIt = cacheMap.find(compPtr);
+            if (cacheIt != cacheMap.end()) {
+                // 从链表中删除该键
+                lruList.erase(cacheIt->second.second);
+                // 从 map 中删除
+                cacheMap.erase(cacheIt);
+            }
         }
     }
     origin(pos);
@@ -245,7 +280,8 @@ bool PluginImpl::load() {
         logger().warn("Failed to load config, using default values and saving");
         saveConfig();
     }
-    logger().info("Plugin loaded. enabled: {}, debug: {}", config.enabled, config.debug);
+    logger().info("Plugin loaded. enabled: {}, debug: {}, maxCacheSize: {}",
+                  config.enabled, config.debug, config.maxCacheSize);
     return true;
 }
 
