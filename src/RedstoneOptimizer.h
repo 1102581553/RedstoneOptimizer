@@ -4,7 +4,6 @@
 #include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 #include <memory>
-#include <unordered_map>
 
 namespace redstone_optimizer {
 
@@ -18,14 +17,14 @@ struct Config {
     int version = 1;
     bool enabled = true;
     bool debug = false;
+    size_t maxCacheSize = 1000000;  // 默认最大缓存条目数（约 128 MB）
 };
 
 Config& getConfig();
 bool loadConfig();
 bool saveConfig();
 
-std::unordered_map<void*, CacheEntry>& getCache();
-void clearCache();
+void clearCache();                   // 清空缓存
 
 ll::io::Logger& logger();
 
