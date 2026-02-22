@@ -85,7 +85,7 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
 void startDebugTask() {
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (true) {
-            co_await 20_tick;   // 约1秒
+            co_await std::chrono::seconds(1);   // 约1秒
             // 将打印任务调度到主线程，避免与钩子并发访问
             ll::thread::ServerThreadExecutor::getDefault().execute([]{
                 if (!getConfig().debug) return;
