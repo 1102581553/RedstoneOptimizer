@@ -62,10 +62,16 @@ bool hasInternalTimer(BaseCircuitComponent* comp) {
 
 // 改进的输入哈希：加入源组件类型信息
 // 修复：增加对 mSources 指针的空值检查，避免缓冲区溢出
+// 修复：处理 TypedStorageImpl 包装器，不能直接使用 ! 运算符
 uint64_t computeInputHash(ConsumerComponent* comp) {
-    if (!comp->mSources) return 0;   // 没有输入源时直接返回0，避免访问空指针
+    // 修复：显式调用 operator->() 获取原始指针进行判空
+    // mSources 是 ll::TypedStorageImpl 包装器，不支持 operator!
+    auto* sources = comp->mSources.operator->(); 
+    if (!sources) return 0;   // 没有输入源时直接返回 0，避免访问空指针
+
     uint64_t hash = 0;
-    for (const auto& item : comp->mSources->mComponents) {
+    // 使用获取到的 sources 指针访问成员
+    for (const auto& item : sources->mComponents) { 
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
         size_t typeHash = typeid(*source).hash_code();   // 组件类型标识
@@ -81,11 +87,11 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
     return hash;
 }
 
-// 安全的调试任务：每20 tick在主线程输出统计
+// 安全的调试任务：每 20 tick 在主线程输出统计
 void startDebugTask() {
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (true) {
-            co_await std::chrono::seconds(1);   // 约1秒
+            co_await std::chrono::seconds(1);   // 约 1 秒
             // 将打印任务调度到主线程，避免与钩子并发访问
             ll::thread::ServerThreadExecutor::getDefault().execute([]{
                 if (!getConfig().debug) return;
@@ -114,14 +120,21 @@ LL_TYPE_INSTANCE_HOOK(
 
     ChunkPos chunkPos(pos);
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
-    auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
+    
+    // 修复：mActiveComponentsPerChunk 也是 TypedStorageImpl 包装器，需使用 .get() 获取底层容器
+    auto& chunkMap = this->mActiveComponentsPerChunk.get();
+    auto& chunkList = chunkMap[chunkBlockPos];
 
-    std::sort(chunkList.mComponents->begin(), chunkList.mComponents->end(),
-        [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
-            if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
-            if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
-            return a.mPos->y < b.mPos->y;
-        });
+    // 修复：mComponents 也是包装器，显式获取指针以防万一
+    auto* compVec = chunkList.mComponents.operator->();
+    if (compVec) {
+        std::sort(compVec->begin(), compVec->end(),
+            [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
+                if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
+                if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
+                return a.mPos->y < b.mPos->y;
+            });
+    }
     chunkList.bShouldEvaluate = true;
 }
 
@@ -180,8 +193,10 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (getConfig().enabled) {
-        auto it = this->mAllComponents.find(pos);
-        if (it != this->mAllComponents.end()) {
+        // 修复：mAllComponents 也是 TypedStorageImpl 包装器，需使用 .get() 获取底层容器
+        auto& allCompMap = this->mAllComponents.get();
+        auto it = allCompMap.find(pos);
+        if (it != allCompMap.end()) {
             getCache().erase(it->second.get());
         }
     }
