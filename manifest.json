@@ -1,7 +1,8 @@
 {
-    "name": "${modName}",
-    "entry": "${modFile}",
-    "version": "${modVersion}",
+    "entry": "RedstoneOptimizer.dll",
+    "name": "RedstoneOptimizer",
     "type": "native",
-    "platform": "${modPlatform}"
+    "version": "1.0.0",
+    "description": "Optimizes redstone performance by reordering updates and caching stable components.",
+    "platform": "server"
 }
