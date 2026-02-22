@@ -11,26 +11,35 @@
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
 #include <mc/world/redstone/circuit/components/ConsumerComponent.h>
 #include <mc/world/redstone/circuit/components/CapacitorComponent.h>
+// 注意：RedstoneTorchCapacitor 通常是内部类，头文件可能不可用，我们依赖 CapacitorComponent 检查
 #include <algorithm>
 #include <filesystem>
-#include <typeinfo>   // 用于 typeid
+#include <typeinfo>
+#include <atomic>
+#include <mutex>
 
 namespace redstone_optimizer {
 
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static std::unordered_map<void*, CacheEntry> cache;
+static std::mutex cacheMutex;  // 缓存线程安全锁
 static bool hookInstalled = false;
+static std::atomic<bool> debugTaskRunning = false;  // 调试任务运行标志
 
-// 统计计数器
-static size_t cacheHitCount  = 0;
-static size_t cacheMissCount = 0;
-static size_t cacheSkipCount = 0;   // 因时序元件跳过缓存的次数
+// 统计计数器 (使用原子类型保证线程安全)
+static std::atomic<size_t> cacheHitCount = 0;
+static std::atomic<size_t> cacheMissCount = 0;
+static std::atomic<size_t> cacheSkipCount = 0;
 
 Config& getConfig() { return config; }
 
 std::unordered_map<void*, CacheEntry>& getCache() { return cache; }
-void clearCache() { cache.clear(); }
+
+void clearCache() {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    cache.clear();
+}
 
 bool loadConfig() {
     auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
@@ -55,19 +64,21 @@ uint64_t getCurrentTickID() {
     return level->getCurrentTick().tickID;
 }
 
-// 判断是否为时序元件（中继器、比较器等）
+// 判断是否为时序元件（中继器、比较器、红石火把等）
+// 根据文档，RedstoneTorchCapacitor 继承自 CapacitorComponent，所以会被此检查捕获
 bool hasInternalTimer(BaseCircuitComponent* comp) {
     return dynamic_cast<CapacitorComponent*>(comp) != nullptr;
 }
 
 // 改进的输入哈希：加入源组件类型信息
 uint64_t computeInputHash(ConsumerComponent* comp) {
-    // mSources 是 TypedStorageImpl<CircuitComponentList*>，需要 operator->() 获取指针
+    // mSources 是 TypedStorage<CircuitComponentList*>，需要 operator->() 获取指针
     auto* sources = comp->mSources.operator->(); 
-    if (!sources) return 0;   // 没有输入源时直接返回 0
+    if (!sources) return 0;
 
     uint64_t hash = 0;
-    // mComponents 是普通 std::vector，直接遍历
+    // 修复：mComponents 是普通 std::vector，直接遍历 (不要调用 operator->())
+    // 文档确认：CircuitComponentList 包含 mComponents
     for (const auto& item : sources->mComponents) { 
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
@@ -83,23 +94,32 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
     return hash;
 }
 
-// 安全的调试任务：每 20 tick 在主线程输出统计
+// 安全的调试任务：带停止标志
 void startDebugTask() {
+    if (debugTaskRunning.exchange(true)) return;  // 防止重复启动
+    
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
-        while (true) {
-            co_await std::chrono::seconds(1);
+        while (debugTaskRunning) {  // 可终止的循环
+            // 修复：使用 LL 协程睡眠 API，而不是 std::chrono
+            co_await ll::coro::sleep(std::chrono::seconds(1)); 
             ll::thread::ServerThreadExecutor::getDefault().execute([]{
                 if (!getConfig().debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
                 double hitRate = total > 0 ? (100.0 * cacheHitCount / total) : 0.0;
+                // 访问缓存大小时加锁
+                std::lock_guard<std::mutex> lock(cacheMutex);
                 logger().info("Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
-                              cacheHitCount, cacheMissCount, cacheSkipCount,
+                              cacheHitCount.load(), cacheMissCount.load(), cacheSkipCount.load(),
                               getCache().size(), hitRate);
             });
         }
+        debugTaskRunning = false;
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
+void stopDebugTask() {
+    debugTaskRunning = false;
+}
 
 LL_TYPE_INSTANCE_HOOK(
     CircuitSceneGraphAddHook,
@@ -116,13 +136,12 @@ LL_TYPE_INSTANCE_HOOK(
     ChunkPos chunkPos(pos);
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
     
-    // mActiveComponentsPerChunk 是 std::unordered_map，直接使用 []
     auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
-    // chunkList.mComponents 是 TypedStorageImpl<std::vector*>, 需要 operator->()
-    auto* compVec = chunkList.mComponents.operator->();
-    if (compVec) {
-        std::sort(compVec->begin(), compVec->end(),
+    // 修复：mComponents 是 std::vector，直接访问 (不要调用 operator->())
+    auto& compVec = chunkList.mComponents;
+    if (!compVec.empty()) {
+        std::sort(compVec.begin(), compVec.end(),
             [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
                 if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
                 if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
@@ -146,22 +165,42 @@ LL_TYPE_INSTANCE_HOOK(
         return origin(system, pos);
     }
 
+    // 1. 跳过时序元件 (中继器、比较器、红石火把)
+    // 根据文档，RedstoneTorchCapacitor 继承自 CapacitorComponent，会被此检查捕获
+    // 这防止了缓存破坏红石火把的烧毁机制
+    if (hasInternalTimer(this)) {
+        ++cacheSkipCount;
+        return origin(system, pos);
+    }
+
     uint64_t currentHash = computeInputHash(this);
+    
+    // 2. 线程安全访问缓存
+    std::lock_guard<std::mutex> lock(cacheMutex);
     auto it = getCache().find(this);
 
     if (it != getCache().end() && it->second.inputHash == currentHash) {
-        if (hasInternalTimer(this)) {
-            ++cacheSkipCount;
-            return origin(system, pos);
+        // 3. 修复返回值逻辑：仅当强度变化时才返回 true
+        int oldStrength = this->getStrength();
+        int cachedStrength = it->second.lastOutputStrength;
+        
+        if (oldStrength != cachedStrength) {
+            this->setStrength(cachedStrength);
+            if (getConfig().debug) {
+                logger().debug("Cache hit & updated at ({},{},{})", pos.x, pos.y, pos.z);
+            }
+            ++cacheHitCount;
+            return true;  // 状态改变，通知邻居
+        } else {
+            if (getConfig().debug) {
+                logger().debug("Cache hit (no change) at ({},{},{})", pos.x, pos.y, pos.z);
+            }
+            ++cacheHitCount;
+            return false;  // 状态未变，不通知邻居 (关键优化)
         }
-        this->setStrength(it->second.lastOutputStrength);
-        if (getConfig().debug) {
-            logger().debug("Cache hit at ({},{},{})", pos.x, pos.y, pos.z);
-        }
-        ++cacheHitCount;
-        return true;
     }
 
+    // 缓存未命中，执行原版 evaluate
     bool result = origin(system, pos);
     getCache()[this] = CacheEntry{
         .inputHash = currentHash,
@@ -184,7 +223,7 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (getConfig().enabled) {
-        // mAllComponents 是 std::unordered_map，直接使用 find()
+        std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = this->mAllComponents.find(pos);
         if (it != this->mAllComponents.end()) {
             getCache().erase(it->second.get());
@@ -222,6 +261,7 @@ bool PluginImpl::enable() {
 }
 
 bool PluginImpl::disable() {
+    stopDebugTask();  // 修复：停止调试任务
     if (hookInstalled) {
         CircuitSceneGraphAddHook::unhook();
         ConsumerComponentEvaluateHook::unhook();
