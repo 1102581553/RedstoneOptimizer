@@ -19,13 +19,7 @@ namespace redstone_optimizer {
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static std::unordered_map<void*, CacheEntry> cache;
-
-// 缓存条目结构
-struct CacheEntry {
-    uint64_t inputHash;
-    int lastOutputStrength;
-    uint64_t lastUpdateTick;
-};
+static bool hookInstalled = false;
 
 Config& getConfig() { return config; }
 
@@ -49,9 +43,6 @@ ll::io::Logger& logger() {
     return *log;
 }
 
-// ============================
-// 辅助函数
-// ============================
 uint64_t getCurrentTickID() {
     auto level = ll::service::getLevel();
     if (!level) return 0;
@@ -81,58 +72,18 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
     return hash;
 }
 
-// ============================
-// 调试任务：每秒输出缓存统计
-// ============================
 void startDebugTask() {
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (true) {
             co_await std::chrono::seconds(1);
             if (getConfig().debug) {
                 logger().info("Cache size: {}", getCache().size());
-                // 可扩展更多统计，如命中率等
             }
         }
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
-// ============================
-// 钩子定义（非自动注册）
-// ============================
-LL_TYPE_INSTANCE_HOOK(
-    CircuitSceneGraphAddHook,
-    ll::memory::HookPriority::Normal,
-    CircuitSceneGraph,
-    &CircuitSceneGraph::add,
-    void,
-    BlockPos const& pos,
-    std::unique_ptr<BaseCircuitComponent> component
-);
-
-LL_TYPE_INSTANCE_HOOK(
-    ConsumerComponentEvaluateHook,
-    ll::memory::HookPriority::Normal,
-    ConsumerComponent,
-    &ConsumerComponent::evaluate,
-    bool,
-    CircuitSystem& system,
-    BlockPos const& pos
-);
-
-LL_TYPE_INSTANCE_HOOK(
-    CircuitSceneGraphRemoveComponentHook,
-    ll::memory::HookPriority::Normal,
-    CircuitSceneGraph,
-    &CircuitSceneGraph::removeComponent,
-    void,
-    BlockPos const& pos
-);
-
-// ============================
-// 钩子实现
-// ============================
-bool g_hooksInstalled = false;
-
+// ============================ 钩子定义 ============================
 LL_TYPE_INSTANCE_HOOK(
     CircuitSceneGraphAddHook,
     ll::memory::HookPriority::Normal,
@@ -143,7 +94,6 @@ LL_TYPE_INSTANCE_HOOK(
     std::unique_ptr<BaseCircuitComponent> component
 ) {
     origin(pos, std::move(component));
-
     if (!getConfig().enabled) return;
 
     ChunkPos chunkPos(pos);
@@ -156,7 +106,6 @@ LL_TYPE_INSTANCE_HOOK(
             if (a.mPos.z != b.mPos.z) return a.mPos.z < b.mPos.z;
             return a.mPos.y < b.mPos.y;
         });
-
     chunkList.bShouldEvaluate = true;
 }
 
@@ -169,40 +118,25 @@ LL_TYPE_INSTANCE_HOOK(
     CircuitSystem& system,
     BlockPos const& pos
 ) {
-    if (!getConfig().enabled) {
-        return origin(system, pos);
-    }
+    if (!getConfig().enabled) return origin(system, pos);
 
     uint64_t currentHash = computeInputHash(this);
     auto& cache = getCache();
-
     auto it = cache.find(this);
-    if (it != cache.end()) {
-        auto& entry = it->second;
-        if (entry.inputHash == currentHash) {
-            if (hasInternalTimer(this)) {
-                return origin(system, pos);
-            }
-            this->setStrength(entry.lastOutputStrength);
-            if (getConfig().debug) {
-                logger().debug("Cache hit for component at ({},{},{})", pos.x, pos.y, pos.z);
-            }
-            return true;
-        }
+    if (it != cache.end() && it->second.inputHash == currentHash) {
+        if (hasInternalTimer(this)) return origin(system, pos);
+        this->setStrength(it->second.lastOutputStrength);
+        if (getConfig().debug) logger().debug("Cache hit at ({},{},{})", pos.x, pos.y, pos.z);
+        return true;
     }
 
     bool result = origin(system, pos);
-
-    cache[this] = {
+    cache[this] = CacheEntry{
         .inputHash = currentHash,
         .lastOutputStrength = this->getStrength(),
         .lastUpdateTick = getCurrentTickID()
     };
-
-    if (getConfig().debug) {
-        logger().debug("Cache miss for component at ({},{},{})", pos.x, pos.y, pos.z);
-    }
-
+    if (getConfig().debug) logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
     return result;
 }
 
@@ -217,16 +151,13 @@ LL_TYPE_INSTANCE_HOOK(
     if (getConfig().enabled) {
         auto it = this->mAllComponents.find(pos);
         if (it != this->mAllComponents.end()) {
-            BaseCircuitComponent* comp = it->second.get();
-            getCache().erase(comp);
+            getCache().erase(it->second.get());
         }
     }
     origin(pos);
 }
 
-// ============================
-// 插件实现
-// ============================
+// ============================ 插件实现 ============================
 PluginImpl& PluginImpl::getInstance() {
     static PluginImpl instance;
     return instance;
@@ -238,39 +169,32 @@ bool PluginImpl::load() {
         logger().warn("Failed to load config, using default values and saving");
         saveConfig();
     }
-    logger().info("Plugin loaded. Redstone optimization: {}, debug: {}",
-                  config.enabled ? "enabled" : "disabled",
-                  config.debug ? "enabled" : "disabled");
+    logger().info("Plugin loaded. enabled: {}, debug: {}", config.enabled, config.debug);
     return true;
 }
 
 bool PluginImpl::enable() {
-    if (!mHooksInstalled) {
+    if (!hookInstalled) {
         CircuitSceneGraphAddHook::hook();
         ConsumerComponentEvaluateHook::hook();
         CircuitSceneGraphRemoveComponentHook::hook();
-        mHooksInstalled = true;
+        hookInstalled = true;
         logger().debug("Hooks installed");
     }
-
-    if (config.debug) {
-        startDebugTask();
-    }
-
+    if (config.debug) startDebugTask();
     logger().info("Plugin enabled");
     return true;
 }
 
 bool PluginImpl::disable() {
-    if (mHooksInstalled) {
+    if (hookInstalled) {
         CircuitSceneGraphAddHook::unhook();
         ConsumerComponentEvaluateHook::unhook();
         CircuitSceneGraphRemoveComponentHook::unhook();
-        mHooksInstalled = false;
+        hookInstalled = false;
         clearCache();
         logger().debug("Hooks uninstalled and cache cleared");
     }
-
     logger().info("Plugin disabled");
     return true;
 }
