@@ -51,20 +51,12 @@ uint64_t getCurrentTickID() {
 
 bool hasInternalTimer(BaseCircuitComponent* comp) {
     // TODO: 根据实际枚举值调整
-    // 暂时跳过时序元件处理，全部当作非时序
+    (void)comp; // 消除未使用参数警告
     return false;
-
-    // 原代码（需根据实际头文件修正）：
-    // auto type = comp->getCircuitComponentType();
-    // return type == CircuitComponentType::Repeater
-    //     || type == CircuitComponentType::Comparator
-    //     || type == CircuitComponentType::RedstoneTorch
-    //     || type == CircuitComponentType::PulseCapacitor;
 }
 
 uint64_t computeInputHash(ConsumerComponent* comp) {
     uint64_t hash = 0;
-    // 通过 operator-> 访问 mSources 内部对象
     for (const auto& item : comp->mSources->mComponents) {
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
@@ -106,10 +98,8 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
     auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
-    // 通过 operator-> 访问 mComponents 内部 vector
     std::sort(chunkList.mComponents->begin(), chunkList.mComponents->end(),
         [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
-            // 通过 operator-> 访问 mPos 的坐标
             if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
             if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
             return a.mPos->y < b.mPos->y;
@@ -117,7 +107,6 @@ LL_TYPE_INSTANCE_HOOK(
     chunkList.bShouldEvaluate = true;
 }
 
-// 注意：虚函数需要 $ 前缀
 LL_TYPE_INSTANCE_HOOK(
     ConsumerComponentEvaluateHook,
     ll::memory::HookPriority::Normal,
@@ -134,7 +123,7 @@ LL_TYPE_INSTANCE_HOOK(
     if (it != getCache().end() && it->second.inputHash == currentHash) {
         if (hasInternalTimer(this)) return origin(system, pos);
         this->setStrength(it->second.lastOutputStrength);
-        if (getConfig().debug) logger().debug("Cache hit at ({},{},{})", pos->x, pos->y, pos->z);
+        if (getConfig().debug) logger().debug("Cache hit at ({},{},{})", pos.x, pos.y, pos.z);
         return true;
     }
 
@@ -144,7 +133,7 @@ LL_TYPE_INSTANCE_HOOK(
         .lastOutputStrength = this->getStrength(),
         .lastUpdateTick = getCurrentTickID()
     };
-    if (getConfig().debug) logger().debug("Cache miss at ({},{},{})", pos->x, pos->y, pos->z);
+    if (getConfig().debug) logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
     return result;
 }
 
