@@ -15,6 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#include <excpt.h>  // for SEH
 
 namespace redstone_optimizer {
 
@@ -31,10 +32,6 @@ static std::atomic<size_t> cacheSkipCount = 0;
 
 thread_local int evaluateDepth = 0;
 constexpr int MAX_EVALUATE_DEPTH = 500;
-
-// 用于抑制重复日志
-static std::unordered_set<BlockPos> warnedPositions;
-static std::mutex warnedMutex;
 
 Config& getConfig() { return config; }
 
@@ -68,10 +65,10 @@ uint64_t getCurrentTickID() {
     return level->getCurrentTick().tickID;
 }
 
-// 不再使用 RTTI，仅根据数据计算哈希
+// 不再使用时序元件检测，所有 ConsumerComponent 都参与缓存
+// 仅使用数据计算哈希，避免 RTTI
 uint64_t computeInputHash(ConsumerComponent* comp) {
     uint64_t hash = 0;
-    // 即使 comp 无效，后续访问成员可能崩溃，但外层有 SEH 保护，这里不再额外处理
     auto* sources = comp->mSources.operator->();
     if (!sources) return 0;
 
@@ -79,7 +76,7 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
         // 移除 typeid，仅使用数据
-        int strength = source->getStrength(); // 可能崩溃，但外层 SEH 会捕获
+        int strength = source->getStrength();
         hash = hash * 31 + strength;
         hash = hash * 31 + item.mDampening;
         hash = hash * 31 + (item.mDirectlyPowered ? 1 : 0);
@@ -140,7 +137,6 @@ LL_TYPE_INSTANCE_HOOK(
     chunkList.bShouldEvaluate = true;
 }
 
-// 使用 SEH 保护钩子主体
 LL_TYPE_INSTANCE_HOOK(
     ConsumerComponentEvaluateHook,
     ll::memory::HookPriority::Normal,
@@ -150,10 +146,13 @@ LL_TYPE_INSTANCE_HOOK(
     CircuitSystem& system,
     BlockPos const& pos
 ) {
+    // 使用 SEH 保护可能崩溃的代码段（如访问无效 this）
+    uint64_t currentHash = 0;
+    bool hashComputed = false;
+
     __try {
         ++evaluateDepth;
         if (evaluateDepth > MAX_EVALUATE_DEPTH) {
-            logger().warn("Evaluate depth exceeded at ({},{},{}) depth={}", pos.x, pos.y, pos.z, evaluateDepth);
             bool result = origin(system, pos);
             --evaluateDepth;
             return result;
@@ -166,9 +165,18 @@ LL_TYPE_INSTANCE_HOOK(
             return result;
         }
 
-        // 不再检查时序元件，所有 ConsumerComponent 都缓存
-        uint64_t currentHash = computeInputHash(this);
+        // 计算哈希（可能因无效 this 崩溃）
+        currentHash = computeInputHash(this);
+        hashComputed = true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        // 发生结构化异常（如访问违例），直接回退到原版
+        --evaluateDepth;
+        return origin(system, pos);
+    }
 
+    // 如果成功计算哈希，说明 this 至少可安全访问，继续缓存逻辑
+    if (hashComputed) {
+        // 缓存操作需要加锁（这里会有对象析构，但已在 SEH 块外）
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = getCache().find(this);
 
@@ -192,26 +200,25 @@ LL_TYPE_INSTANCE_HOOK(
                 --evaluateDepth;
                 return false;
             }
+        } else {
+            bool result = origin(system, pos);
+            getCache()[this] = CacheEntry{
+                .inputHash = currentHash,
+                .lastOutputStrength = this->getStrength(),
+                .lastUpdateTick = getCurrentTickID()
+            };
+            if (getConfig().debug) {
+                logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
+            }
+            ++cacheMissCount;
+            --evaluateDepth;
+            return result;
         }
+    }
 
-        bool result = origin(system, pos);
-        getCache()[this] = CacheEntry{
-            .inputHash = currentHash,
-            .lastOutputStrength = this->getStrength(),
-            .lastUpdateTick = getCurrentTickID()
-        };
-        if (getConfig().debug) {
-            logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
-        }
-        ++cacheMissCount;
-        --evaluateDepth;
-        return result;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // 任何结构化异常（如访问违例）都直接调用原版函数
-        --evaluateDepth;  // 注意：如果异常发生在 depth 递增之前，这里可能负值，但概率极低
-        return origin(system, pos);
-    }
+    // 理论上不会执行到这里，但为安全起见调用原版
+    --evaluateDepth;
+    return origin(system, pos);
 }
 
 LL_TYPE_INSTANCE_HOOK(
