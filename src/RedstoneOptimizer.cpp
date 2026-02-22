@@ -61,23 +61,18 @@ bool hasInternalTimer(BaseCircuitComponent* comp) {
 }
 
 // 改进的输入哈希：加入源组件类型信息
-// 修复：处理 TypedStorageImpl 包装器，不能直接使用 ! 运算符
 uint64_t computeInputHash(ConsumerComponent* comp) {
-    // 修复：mSources 是 TypedStorageImpl 包装器，显式调用 operator->() 获取原始指针
+    // mSources 是 TypedStorageImpl<CircuitComponentList*>，需要 operator->() 获取指针
     auto* sources = comp->mSources.operator->(); 
-    if (!sources) return 0;   // 没有输入源时直接返回 0，避免访问空指针
+    if (!sources) return 0;   // 没有输入源时直接返回 0
 
     uint64_t hash = 0;
-    // 修复：mComponents 也是 TypedStorageImpl 包装器，显式获取指针
-    auto* compVec = sources->mComponents.operator->();
-    if (!compVec) return 0;
-    
-    for (const auto& item : *compVec) { 
+    // mComponents 是普通 std::vector，直接遍历
+    for (const auto& item : sources->mComponents) { 
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
-        size_t typeHash = typeid(*source).hash_code();   // 组件类型标识
+        size_t typeHash = typeid(*source).hash_code();
         int strength = source->getStrength();
-        // 组合哈希
         hash = hash * 31 + typeHash;
         hash = hash * 31 + strength;
         hash = hash * 31 + item.mDampening;
@@ -92,8 +87,7 @@ uint64_t computeInputHash(ConsumerComponent* comp) {
 void startDebugTask() {
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (true) {
-            co_await std::chrono::seconds(1);   // 约 1 秒
-            // 将打印任务调度到主线程，避免与钩子并发访问
+            co_await std::chrono::seconds(1);
             ll::thread::ServerThreadExecutor::getDefault().execute([]{
                 if (!getConfig().debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
@@ -122,10 +116,10 @@ LL_TYPE_INSTANCE_HOOK(
     ChunkPos chunkPos(pos);
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
     
-    // 修复：mActiveComponentsPerChunk 是 std::unordered_map，直接使用 [] 操作符
+    // mActiveComponentsPerChunk 是 std::unordered_map，直接使用 []
     auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
-    // 修复：mComponents 是 TypedStorageImpl 包装器，显式获取指针
+    // chunkList.mComponents 是 TypedStorageImpl<std::vector*>, 需要 operator->()
     auto* compVec = chunkList.mComponents.operator->();
     if (compVec) {
         std::sort(compVec->begin(), compVec->end(),
@@ -148,7 +142,7 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (!getConfig().enabled) {
-        ++cacheSkipCount;   // 统计因配置禁用而跳过的元件
+        ++cacheSkipCount;
         return origin(system, pos);
     }
 
@@ -156,12 +150,10 @@ LL_TYPE_INSTANCE_HOOK(
     auto it = getCache().find(this);
 
     if (it != getCache().end() && it->second.inputHash == currentHash) {
-        // 命中缓存，但需判断是否为时序元件
         if (hasInternalTimer(this)) {
             ++cacheSkipCount;
-            return origin(system, pos);   // 时序元件不缓存
+            return origin(system, pos);
         }
-        // 缓存命中且非时序，直接复用
         this->setStrength(it->second.lastOutputStrength);
         if (getConfig().debug) {
             logger().debug("Cache hit at ({},{},{})", pos.x, pos.y, pos.z);
@@ -170,7 +162,6 @@ LL_TYPE_INSTANCE_HOOK(
         return true;
     }
 
-    // 缓存未命中，执行原版 evaluate
     bool result = origin(system, pos);
     getCache()[this] = CacheEntry{
         .inputHash = currentHash,
@@ -193,7 +184,7 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (getConfig().enabled) {
-        // 修复：mAllComponents 是 std::unordered_map，直接使用 find()
+        // mAllComponents 是 std::unordered_map，直接使用 find()
         auto it = this->mAllComponents.find(pos);
         if (it != this->mAllComponents.end()) {
             getCache().erase(it->second.get());
