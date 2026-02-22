@@ -8,19 +8,23 @@
 
 namespace redstone_optimizer {
 
-// 配置结构
+struct CacheEntry {
+    uint64_t inputHash;
+    int lastOutputStrength;
+    uint64_t lastUpdateTick;
+};
+
 struct Config {
     int version = 1;
-    bool enabled = true;      // 红石优化总开关
-    bool debug = false;       // 调试开关，输出缓存命中等信息
+    bool enabled = true;
+    bool debug = false;
 };
 
 Config& getConfig();
 bool loadConfig();
 bool saveConfig();
 
-// 缓存访问（供Hook使用）
-std::unordered_map<void*, class CacheEntry>& getCache();
+std::unordered_map<void*, CacheEntry>& getCache();
 void clearCache();
 
 ll::io::Logger& logger();
@@ -39,7 +43,6 @@ public:
 
 private:
     ll::mod::NativeMod& mSelf;
-    bool mHooksInstalled = false;
 };
 
 } // namespace redstone_optimizer
