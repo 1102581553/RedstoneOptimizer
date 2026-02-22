@@ -1,34 +1,45 @@
 #pragma once
 
-#include <ll/api/Mod.h>
+#include <ll/api/Config.h>
+#include <ll/api/io/Logger.h>
+#include <ll/api/mod/NativeMod.h>
+#include <memory>
 #include <unordered_map>
 
 namespace redstone_optimizer {
 
-// 缓存条目结构
-struct CacheEntry {
-    uint64_t inputHash;          // 输入哈希值
-    int lastOutputStrength;       // 上次计算的输出强度
-    uint64_t lastUpdateTick;      // 上次更新时的游戏刻ID
+// 配置结构
+struct Config {
+    int version = 1;
+    bool enabled = true;      // 红石优化总开关
+    bool debug = false;       // 调试开关，输出缓存命中等信息
 };
 
-// 插件主类
-class RedstoneOptimizer : public ll::Mod {
+Config& getConfig();
+bool loadConfig();
+bool saveConfig();
+
+// 缓存访问（供Hook使用）
+std::unordered_map<void*, class CacheEntry>& getCache();
+void clearCache();
+
+ll::io::Logger& logger();
+
+class PluginImpl {
 public:
-    // 获取插件实例
-    static RedstoneOptimizer& getInstance();
+    static PluginImpl& getInstance();
 
-    // 生命周期方法
-    bool load() override;
-    bool enable() override;
-    bool disable() override;
-    bool unload() override;
+    PluginImpl() : mSelf(*ll::mod::NativeMod::current()) {}
 
-    // 缓存访问（供Hook使用，键为 BaseCircuitComponent*）
-    static std::unordered_map<void*, CacheEntry>& getCache();
+    [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
+
+    bool load();
+    bool enable();
+    bool disable();
 
 private:
-    std::unordered_map<void*, CacheEntry> mCache;
+    ll::mod::NativeMod& mSelf;
+    bool mHooksInstalled = false;
 };
 
 } // namespace redstone_optimizer
