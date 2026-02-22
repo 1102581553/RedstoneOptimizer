@@ -61,7 +61,9 @@ bool hasInternalTimer(BaseCircuitComponent* comp) {
 }
 
 // 改进的输入哈希：加入源组件类型信息
+// 修复：增加对 mSources 指针的空值检查，避免缓冲区溢出
 uint64_t computeInputHash(ConsumerComponent* comp) {
+    if (!comp->mSources) return 0;   // 没有输入源时直接返回0，避免访问空指针
     uint64_t hash = 0;
     for (const auto& item : comp->mSources->mComponents) {
         BaseCircuitComponent* source = item.mComponent;
@@ -97,7 +99,7 @@ void startDebugTask() {
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
-// ============================ 钩子定义 ============================
+
 LL_TYPE_INSTANCE_HOOK(
     CircuitSceneGraphAddHook,
     ll::memory::HookPriority::Normal,
@@ -186,7 +188,6 @@ LL_TYPE_INSTANCE_HOOK(
     origin(pos);
 }
 
-// ============================ 插件实现 ============================
 PluginImpl& PluginImpl::getInstance() {
     static PluginImpl instance;
     return instance;
@@ -222,7 +223,7 @@ bool PluginImpl::disable() {
         CircuitSceneGraphRemoveComponentHook::unhook();
         hookInstalled = false;
         clearCache();
-        // 可选：重置计数器
+
         cacheHitCount = cacheMissCount = cacheSkipCount = 0;
         logger().debug("Hooks uninstalled, cache cleared, counters reset");
     }
