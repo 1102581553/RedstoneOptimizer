@@ -100,8 +100,8 @@ void startDebugTask() {
     
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (debugTaskRunning) {  // 可终止的循环
-            // 修复：使用 LL 协程睡眠 API，而不是 std::chrono
-            co_await ll::coro::sleep(std::chrono::seconds(1)); 
+            // 修复：使用 C++20 标准协程睡眠，而非 ll::coro::sleep（1.9.5 中不存在）
+            co_await std::chrono::seconds(1); 
             ll::thread::ServerThreadExecutor::getDefault().execute([]{
                 if (!getConfig().debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
@@ -138,10 +138,10 @@ LL_TYPE_INSTANCE_HOOK(
     
     auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
-    // 修复：mComponents 是 std::vector，直接访问 (不要调用 operator->())
-    auto& compVec = chunkList.mComponents;
-    if (!compVec.empty()) {
-        std::sort(compVec.begin(), compVec.end(),
+    // 修复：mComponents 是 TypedStorage，必须通过 operator->() 获取内部 vector 指针
+    auto* pCompVec = chunkList.mComponents.operator->();
+    if (pCompVec && !pCompVec->empty()) {
+        std::sort(pCompVec->begin(), pCompVec->end(),
             [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
                 if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
                 if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
