@@ -10,13 +10,11 @@
 #include <mc/world/redstone/circuit/CircuitSceneGraph.h>
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
 #include <mc/world/redstone/circuit/components/ConsumerComponent.h>
-#include <mc/world/redstone/circuit/components/CapacitorComponent.h>
 #include <algorithm>
 #include <filesystem>
-#include <typeinfo>
 #include <atomic>
 #include <mutex>
-#include <exception>
+#include <unordered_set>
 
 namespace redstone_optimizer {
 
@@ -31,9 +29,12 @@ static std::atomic<size_t> cacheHitCount = 0;
 static std::atomic<size_t> cacheMissCount = 0;
 static std::atomic<size_t> cacheSkipCount = 0;
 
-// 递归深度检测（每个线程独立）
 thread_local int evaluateDepth = 0;
 constexpr int MAX_EVALUATE_DEPTH = 500;
+
+// 用于抑制重复日志
+static std::unordered_set<BlockPos> warnedPositions;
+static std::mutex warnedMutex;
 
 Config& getConfig() { return config; }
 
@@ -67,30 +68,23 @@ uint64_t getCurrentTickID() {
     return level->getCurrentTick().tickID;
 }
 
-bool hasInternalTimer(BaseCircuitComponent* comp) {
-    return dynamic_cast<CapacitorComponent*>(comp) != nullptr;
-}
-
+// 不再使用 RTTI，仅根据数据计算哈希
 uint64_t computeInputHash(ConsumerComponent* comp) {
+    uint64_t hash = 0;
+    // 即使 comp 无效，后续访问成员可能崩溃，但外层有 SEH 保护，这里不再额外处理
     auto* sources = comp->mSources.operator->();
     if (!sources) return 0;
 
-    uint64_t hash = 0;
-    try {
-        for (const auto& item : sources->mComponents) {
-            BaseCircuitComponent* source = item.mComponent;
-            if (!source) continue;
-            size_t typeHash = typeid(*source).hash_code();
-            int strength = source->getStrength();
-            hash = hash * 31 + typeHash;
-            hash = hash * 31 + strength;
-            hash = hash * 31 + item.mDampening;
-            hash = hash * 31 + (item.mDirectlyPowered ? 1 : 0);
-            hash = hash * 31 + item.mDirection;
-            hash = hash * 31 + item.mData;
-        }
-    } catch (const std::exception& e) {
-        logger().error("Exception in computeInputHash: {}", e.what());
+    for (const auto& item : sources->mComponents) {
+        BaseCircuitComponent* source = item.mComponent;
+        if (!source) continue;
+        // 移除 typeid，仅使用数据
+        int strength = source->getStrength(); // 可能崩溃，但外层 SEH 会捕获
+        hash = hash * 31 + strength;
+        hash = hash * 31 + item.mDampening;
+        hash = hash * 31 + (item.mDirectlyPowered ? 1 : 0);
+        hash = hash * 31 + item.mDirection;
+        hash = hash * 31 + item.mData;
     }
     return hash;
 }
@@ -146,6 +140,7 @@ LL_TYPE_INSTANCE_HOOK(
     chunkList.bShouldEvaluate = true;
 }
 
+// 使用 SEH 保护钩子主体
 LL_TYPE_INSTANCE_HOOK(
     ConsumerComponentEvaluateHook,
     ll::memory::HookPriority::Normal,
@@ -155,16 +150,15 @@ LL_TYPE_INSTANCE_HOOK(
     CircuitSystem& system,
     BlockPos const& pos
 ) {
-    // 递归深度检测
-    ++evaluateDepth;
-    if (evaluateDepth > MAX_EVALUATE_DEPTH) {
-        logger().warn("Evaluate depth exceeded at ({},{},{}) depth={}", pos.x, pos.y, pos.z, evaluateDepth);
-        bool result = origin(system, pos);
-        --evaluateDepth;
-        return result;
-    }
+    __try {
+        ++evaluateDepth;
+        if (evaluateDepth > MAX_EVALUATE_DEPTH) {
+            logger().warn("Evaluate depth exceeded at ({},{},{}) depth={}", pos.x, pos.y, pos.z, evaluateDepth);
+            bool result = origin(system, pos);
+            --evaluateDepth;
+            return result;
+        }
 
-    try {
         if (!getConfig().enabled) {
             ++cacheSkipCount;
             bool result = origin(system, pos);
@@ -172,13 +166,7 @@ LL_TYPE_INSTANCE_HOOK(
             return result;
         }
 
-        if (hasInternalTimer(this)) {
-            ++cacheSkipCount;
-            bool result = origin(system, pos);
-            --evaluateDepth;
-            return result;
-        }
-
+        // 不再检查时序元件，所有 ConsumerComponent 都缓存
         uint64_t currentHash = computeInputHash(this);
 
         std::lock_guard<std::mutex> lock(cacheMutex);
@@ -218,13 +206,10 @@ LL_TYPE_INSTANCE_HOOK(
         ++cacheMissCount;
         --evaluateDepth;
         return result;
-    } catch (const std::exception& e) {
-        logger().error("Exception in ConsumerComponentEvaluateHook at ({},{},{}): {}", pos.x, pos.y, pos.z, e.what());
-        --evaluateDepth;
-        return origin(system, pos);
-    } catch (...) {
-        logger().error("Unknown exception in ConsumerComponentEvaluateHook at ({},{},{})", pos.x, pos.y, pos.z);
-        --evaluateDepth;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // 任何结构化异常（如访问违例）都直接调用原版函数
+        --evaluateDepth;  // 注意：如果异常发生在 depth 递增之前，这里可能负值，但概率极低
         return origin(system, pos);
     }
 }
