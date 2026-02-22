@@ -61,17 +61,18 @@ bool hasInternalTimer(BaseCircuitComponent* comp) {
 }
 
 // 改进的输入哈希：加入源组件类型信息
-// 修复：增加对 mSources 指针的空值检查，避免缓冲区溢出
 // 修复：处理 TypedStorageImpl 包装器，不能直接使用 ! 运算符
 uint64_t computeInputHash(ConsumerComponent* comp) {
-    // 修复：显式调用 operator->() 获取原始指针进行判空
-    // mSources 是 ll::TypedStorageImpl 包装器，不支持 operator!
+    // 修复：mSources 是 TypedStorageImpl 包装器，显式调用 operator->() 获取原始指针
     auto* sources = comp->mSources.operator->(); 
     if (!sources) return 0;   // 没有输入源时直接返回 0，避免访问空指针
 
     uint64_t hash = 0;
-    // 使用获取到的 sources 指针访问成员
-    for (const auto& item : sources->mComponents) { 
+    // 修复：mComponents 也是 TypedStorageImpl 包装器，显式获取指针
+    auto* compVec = sources->mComponents.operator->();
+    if (!compVec) return 0;
+    
+    for (const auto& item : *compVec) { 
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
         size_t typeHash = typeid(*source).hash_code();   // 组件类型标识
@@ -121,11 +122,10 @@ LL_TYPE_INSTANCE_HOOK(
     ChunkPos chunkPos(pos);
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
     
-    // 修复：mActiveComponentsPerChunk 也是 TypedStorageImpl 包装器，需使用 .get() 获取底层容器
-    auto& chunkMap = this->mActiveComponentsPerChunk.get();
-    auto& chunkList = chunkMap[chunkBlockPos];
+    // 修复：mActiveComponentsPerChunk 是 std::unordered_map，直接使用 [] 操作符
+    auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
-    // 修复：mComponents 也是包装器，显式获取指针以防万一
+    // 修复：mComponents 是 TypedStorageImpl 包装器，显式获取指针
     auto* compVec = chunkList.mComponents.operator->();
     if (compVec) {
         std::sort(compVec->begin(), compVec->end(),
@@ -193,10 +193,9 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (getConfig().enabled) {
-        // 修复：mAllComponents 也是 TypedStorageImpl 包装器，需使用 .get() 获取底层容器
-        auto& allCompMap = this->mAllComponents.get();
-        auto it = allCompMap.find(pos);
-        if (it != allCompMap.end()) {
+        // 修复：mAllComponents 是 std::unordered_map，直接使用 find()
+        auto it = this->mAllComponents.find(pos);
+        if (it != this->mAllComponents.end()) {
             getCache().erase(it->second.get());
         }
     }
