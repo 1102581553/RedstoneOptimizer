@@ -17,12 +17,11 @@
 1. 确保已安装 [lip](https://github.com/LiteLDev/lip) 包管理器。
 2. 在服务器根目录运行以下命令：
    ```bash
-   lip install github.com/yourusername/RedstoneOptimizer
+   lip install https://github.com/1102581553/RedstoneOptimizer
    ```
-   将 `yourusername` 替换为实际 GitHub 用户名。
 
 ### 手动安装
-1. 从 [Releases](https://github.com/yourusername/RedstoneOptimizer/releases) 下载最新版本的 `RedstoneOptimizer-windows-x64.zip`。
+1. 从 [Releases](https://github.com/1102581553/RedstoneOptimizer/releases) 下载最新版本的 `RedstoneOptimizer-windows-x64.zip`。
 2. 解压后将 `RedstoneOptimizer.dll` 和 `manifest.json` 放入服务器的 `plugins/RedstoneOptimizer/` 目录（如无该目录请自行创建）。
 3. 重启服务器。
 
@@ -41,7 +40,7 @@
 
 1. 克隆仓库：
    ```bash
-   git clone https://github.com/yourusername/RedstoneOptimizer.git
+   git clone https://github.com/1102581553/RedstoneOptimizer.git
    cd RedstoneOptimizer
    ```
 2. 修改 `xmake.lua` 中的 LeviLamina 依赖版本（若需要）。
