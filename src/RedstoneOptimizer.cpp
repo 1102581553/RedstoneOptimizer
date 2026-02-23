@@ -15,7 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <excpt.h>
-#include <list>          // 新增
+#include <list>
 
 namespace redstone_optimizer {
 
@@ -25,7 +25,7 @@ static std::shared_ptr<ll::io::Logger> log;
 // LRU 缓存结构
 static std::list<void*> lruList;                                   // 链表头部最新，尾部最旧
 static std::unordered_map<void*, std::pair<CacheEntry, std::list<void*>::iterator>> cacheMap; // 键 -> (条目, 链表迭代器)
-static std::mutex cacheMutex;
+static std::recursive_mutex cacheMutex;                            // 改为递归互斥锁，防止递归调用时死锁
 
 static bool hookInstalled = false;
 static std::atomic<bool> debugTaskRunning = false;
@@ -40,7 +40,7 @@ constexpr int MAX_EVALUATE_DEPTH = 500;
 Config& getConfig() { return config; }
 
 void clearCache() {
-    std::lock_guard<std::mutex> lock(cacheMutex);
+    std::lock_guard<std::recursive_mutex> lock(cacheMutex);
     lruList.clear();
     cacheMap.clear();
 }
@@ -111,7 +111,7 @@ void startDebugTask() {
                 if (!getConfig().debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
                 double hitRate = total > 0 ? (100.0 * cacheHitCount / total) : 0.0;
-                std::lock_guard<std::mutex> lock(cacheMutex);
+                std::lock_guard<std::recursive_mutex> lock(cacheMutex);
                 logger().info("Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
                               cacheHitCount.load(), cacheMissCount.load(), cacheSkipCount.load(),
                               cacheMap.size(), hitRate);
@@ -184,7 +184,7 @@ LL_TYPE_INSTANCE_HOOK(
         return result;
     }
 
-    std::lock_guard<std::mutex> lock(cacheMutex);
+    std::lock_guard<std::recursive_mutex> lock(cacheMutex);
 
     auto it = cacheMap.find(this);
 
@@ -253,7 +253,7 @@ LL_TYPE_INSTANCE_HOOK(
     BlockPos const& pos
 ) {
     if (getConfig().enabled) {
-        std::lock_guard<std::mutex> lock(cacheMutex);
+        std::lock_guard<std::recursive_mutex> lock(cacheMutex);
         auto it = this->mAllComponents.find(pos);
         if (it != this->mAllComponents.end()) {
             void* compPtr = it->second.get();
