@@ -92,7 +92,7 @@ static void startDebugTask() {
 
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (debugTaskRunning) {
-            co_await std::chrono::seconds(1);
+            co_await std::chrono::seconds(5);
             ll::thread::ServerThreadExecutor::getDefault().execute([] {
                 if (!config.debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
