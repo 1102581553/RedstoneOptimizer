@@ -12,43 +12,39 @@
 #include <mc/world/redstone/circuit/components/ConsumerComponent.h>
 #include <algorithm>
 #include <filesystem>
-#include <atomic>
-#include <mutex>
-#include <excpt.h>
-#include <list>
 
 namespace redstone_optimizer {
 
+// ====================== 全局状态（主线程独占） ======================
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 
-// LRU 缓存结构
-static std::list<void*> lruList;                                   // 链表头部最新，尾部最旧
-static std::unordered_map<void*, std::pair<CacheEntry, std::list<void*>::iterator>> cacheMap; // 键 -> (条目, 链表迭代器)
-static std::recursive_mutex cacheMutex;                            // 改为递归互斥锁，防止递归调用时死锁
+// 扁平缓存：去掉 LRU 链表，用时间戳做淘汰
+// key = ConsumerComponent*，value = CacheEntry
+static std::unordered_map<void*, CacheEntry> cacheMap;
+static uint64_t cacheGeneration = 0; // 单调递增，用于淘汰判断
 
 static bool hookInstalled = false;
-static std::atomic<bool> debugTaskRunning = false;
+static bool debugTaskRunning = false;
 
-static std::atomic<size_t> cacheHitCount = 0;
-static std::atomic<size_t> cacheMissCount = 0;
-static std::atomic<size_t> cacheSkipCount = 0;
+static size_t cacheHitCount = 0;
+static size_t cacheMissCount = 0;
+static size_t cacheSkipCount = 0;
 
+// 递归深度保护
 thread_local int evaluateDepth = 0;
 constexpr int MAX_EVALUATE_DEPTH = 500;
 
 Config& getConfig() { return config; }
 
 void clearCache() {
-    std::lock_guard<std::recursive_mutex> lock(cacheMutex);
-    lruList.clear();
     cacheMap.clear();
+    cacheGeneration = 0;
 }
 
 bool loadConfig() {
     auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
     bool loaded = ll::config::loadConfig(config, path);
-    // 确保 maxCacheSize 有效
     if (config.maxCacheSize == 0) {
         config.maxCacheSize = 1000000;
     }
@@ -67,64 +63,60 @@ ll::io::Logger& logger() {
     return *log;
 }
 
-uint64_t getCurrentTickID() {
-    auto level = ll::service::getLevel();
-    if (!level) return 0;
-    return level->getCurrentTick().tickID;
-}
+// ====================== 哈希计算 ======================
+static uint64_t computeInputHash(ConsumerComponent* comp) {
+    if (!comp) return 0;
 
-// 仅使用数据计算哈希，避免 RTTI
-uint64_t computeInputHash(ConsumerComponent* comp) {
-    uint64_t hash = 0;
     auto* sources = comp->mSources.operator->();
     if (!sources) return 0;
 
+    uint64_t hash = 0;
     for (const auto& item : sources->mComponents) {
         BaseCircuitComponent* source = item.mComponent;
         if (!source) continue;
+
         int strength = source->getStrength();
-        hash = hash * 31 + strength;
-        hash = hash * 31 + item.mDampening;
-        hash = hash * 31 + (item.mDirectlyPowered ? 1 : 0);
-        hash = hash * 31 + item.mDirection;
-        hash = hash * 31 + item.mData;
+        hash = hash * 131 + static_cast<uint64_t>(strength);
+        hash = hash * 131 + static_cast<uint64_t>(item.mDampening);
+        hash = hash * 131 + (item.mDirectlyPowered ? 1ULL : 0ULL);
+        hash = hash * 131 + static_cast<uint64_t>(item.mDirection);
+        hash = hash * 131 + static_cast<uint64_t>(item.mData);
     }
     return hash;
 }
 
-// 尝试计算哈希，如果崩溃返回 false
-bool tryComputeHash(ConsumerComponent* comp, uint64_t& outHash) {
-    __try {
-        outHash = computeInputHash(comp);
-        return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
+// ====================== 调试任务 ======================
+static void startDebugTask() {
+    if (debugTaskRunning) return;
+    debugTaskRunning = true;
 
-void startDebugTask() {
-    if (debugTaskRunning.exchange(true)) return;
     ll::coro::keepThis([]() -> ll::coro::CoroTask<> {
         while (debugTaskRunning) {
             co_await std::chrono::seconds(1);
-            ll::thread::ServerThreadExecutor::getDefault().execute([]{
-                if (!getConfig().debug) return;
+            ll::thread::ServerThreadExecutor::getDefault().execute([] {
+                if (!config.debug) return;
                 size_t total = cacheHitCount + cacheMissCount;
                 double hitRate = total > 0 ? (100.0 * cacheHitCount / total) : 0.0;
-                std::lock_guard<std::recursive_mutex> lock(cacheMutex);
-                logger().info("Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
-                              cacheHitCount.load(), cacheMissCount.load(), cacheSkipCount.load(),
-                              cacheMap.size(), hitRate);
+                logger().info(
+                    "Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
+                    cacheHitCount, cacheMissCount, cacheSkipCount,
+                    cacheMap.size(), hitRate
+                );
             });
         }
         debugTaskRunning = false;
     }).launch(ll::thread::ServerThreadExecutor::getDefault());
 }
 
-void stopDebugTask() {
+static void stopDebugTask() {
     debugTaskRunning = false;
 }
 
+} // namespace redstone_optimizer
+
+// ====================== Hooks ======================
+
+// 组件添加时有序插入，替代全量排序
 LL_TYPE_INSTANCE_HOOK(
     CircuitSceneGraphAddHook,
     ll::memory::HookPriority::Normal,
@@ -135,24 +127,35 @@ LL_TYPE_INSTANCE_HOOK(
     std::unique_ptr<BaseCircuitComponent> component
 ) {
     origin(pos, std::move(component));
-    if (!getConfig().enabled) return;
+    if (!redstone_optimizer::config.enabled) return;
 
     ChunkPos chunkPos(pos);
     BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
     auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
 
     auto* pCompVec = chunkList.mComponents.operator->();
-    if (pCompVec && !pCompVec->empty()) {
-        std::sort(pCompVec->begin(), pCompVec->end(),
-            [](const ChunkCircuitComponentList::Item& a, const ChunkCircuitComponentList::Item& b) {
-                if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
-                if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
-                return a.mPos->y < b.mPos->y;
-            });
+    if (pCompVec && pCompVec->size() > 1) {
+        // 只有最后一个元素是新插入的，对已排序数组做一次插入排序 O(n)
+        auto cmp = [](const ChunkCircuitComponentList::Item& a,
+                      const ChunkCircuitComponentList::Item& b) {
+            if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
+            if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
+            return a.mPos->y < b.mPos->y;
+        };
+
+        // 从倒数第二个开始向前冒泡
+        for (size_t i = pCompVec->size() - 1; i > 0; --i) {
+            if (cmp((*pCompVec)[i], (*pCompVec)[i - 1])) {
+                std::swap((*pCompVec)[i], (*pCompVec)[i - 1]);
+            } else {
+                break;
+            }
+        }
     }
     chunkList.bShouldEvaluate = true;
 }
 
+// 核心：ConsumerComponent::evaluate 缓存
 LL_TYPE_INSTANCE_HOOK(
     ConsumerComponentEvaluateHook,
     ll::memory::HookPriority::Normal,
@@ -162,88 +165,63 @@ LL_TYPE_INSTANCE_HOOK(
     CircuitSystem& system,
     BlockPos const& pos
 ) {
+    using namespace redstone_optimizer;
+
     ++evaluateDepth;
-    if (evaluateDepth > MAX_EVALUATE_DEPTH) {
+
+    // 递归深度保护 / 插件未启用
+    if (evaluateDepth > MAX_EVALUATE_DEPTH || !config.enabled) {
+        if (config.enabled) ++cacheSkipCount;
         bool result = origin(system, pos);
         --evaluateDepth;
         return result;
     }
 
-    if (!getConfig().enabled) {
-        ++cacheSkipCount;
-        bool result = origin(system, pos);
-        --evaluateDepth;
-        return result;
-    }
+    uint64_t currentHash = computeInputHash(this);
+    void* key = this;
 
-    uint64_t currentHash = 0;
-    if (!tryComputeHash(this, currentHash)) {
-        // 计算哈希时崩溃，直接回退
-        bool result = origin(system, pos);
-        --evaluateDepth;
-        return result;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(cacheMutex);
-
-    auto it = cacheMap.find(this);
-
-    if (it != cacheMap.end() && it->second.first.inputHash == currentHash) {
-        // 命中缓存：将对应节点移到链表头部（最近使用）
-        lruList.splice(lruList.begin(), lruList, it->second.second);
-
+    // 查缓存
+    auto it = cacheMap.find(key);
+    if (it != cacheMap.end() && it->second.inputHash == currentHash) {
+        // 缓存命中
         int oldStrength = this->getStrength();
-        int cachedStrength = it->second.first.lastOutputStrength;
+        int cachedStrength = it->second.lastOutputStrength;
+        ++cacheHitCount;
+        --evaluateDepth;
 
         if (oldStrength != cachedStrength) {
             this->setStrength(cachedStrength);
-            if (getConfig().debug) {
-                logger().debug("Cache hit & updated at ({},{},{})", pos.x, pos.y, pos.z);
-            }
-            ++cacheHitCount;
-            --evaluateDepth;
             return true;
-        } else {
-            if (getConfig().debug) {
-                logger().debug("Cache hit (no change) at ({},{},{})", pos.x, pos.y, pos.z);
-            }
-            ++cacheHitCount;
-            --evaluateDepth;
-            return false;
         }
-    } else {
-        // 未命中：调用原函数，然后插入新缓存
-        bool result = origin(system, pos);
-
-        // 插入前检查是否需要淘汰最久未使用的条目
-        if (cacheMap.size() >= getConfig().maxCacheSize) {
-            // 淘汰链表尾部（最久未使用）
-            void* oldestKey = lruList.back();
-            cacheMap.erase(oldestKey);
-            lruList.pop_back();
-        }
-
-        // 在链表头部插入新键
-        lruList.push_front(this);
-        // 存储缓存条目及链表迭代器
-        cacheMap[this] = {
-            CacheEntry{
-                .inputHash = currentHash,
-                .lastOutputStrength = this->getStrength(),
-                .lastUpdateTick = getCurrentTickID()
-            },
-            lruList.begin()
-        };
-
-        if (getConfig().debug) {
-            logger().debug("Cache miss at ({},{},{})", pos.x, pos.y, pos.z);
-        }
-        ++cacheMissCount;
-        --evaluateDepth;
-        return result;
+        return false;
     }
+
+    // 缓存未命中：执行原函数
+    // 注意：origin() 可能递归触发其他 evaluate，修改 cacheMap
+    // 所以 origin() 之后不能使用之前的迭代器
+    bool result = origin(system, pos);
+
+    // origin() 返回后重新操作 cacheMap（迭代器已失效，不复用）
+    // 简单淘汰：超过上限时清空一半（摊销 O(1)，避免 LRU 链表开销）
+    if (cacheMap.size() >= config.maxCacheSize) {
+        // 批量清理：直接清空，下一轮重新填充
+        // 对于红石电路，活跃组件会很快重新缓存
+        cacheMap.clear();
+        ++cacheGeneration;
+    }
+
+    // 直接插入或覆盖
+    cacheMap[key] = CacheEntry{
+        .inputHash = currentHash,
+        .lastOutputStrength = this->getStrength()
+    };
+
+    ++cacheMissCount;
+    --evaluateDepth;
+    return result;
 }
 
+// 组件移除时清理缓存
 LL_TYPE_INSTANCE_HOOK(
     CircuitSceneGraphRemoveComponentHook,
     ll::memory::HookPriority::Normal,
@@ -252,22 +230,17 @@ LL_TYPE_INSTANCE_HOOK(
     void,
     BlockPos const& pos
 ) {
-    if (getConfig().enabled) {
-        std::lock_guard<std::recursive_mutex> lock(cacheMutex);
-        auto it = this->mAllComponents.find(pos);
-        if (it != this->mAllComponents.end()) {
-            void* compPtr = it->second.get();
-            auto cacheIt = cacheMap.find(compPtr);
-            if (cacheIt != cacheMap.end()) {
-                // 从链表中删除该键
-                lruList.erase(cacheIt->second.second);
-                // 从 map 中删除
-                cacheMap.erase(cacheIt);
-            }
+    if (redstone_optimizer::config.enabled) {
+        auto compIt = this->mAllComponents.find(pos);
+        if (compIt != this->mAllComponents.end()) {
+            redstone_optimizer::cacheMap.erase(compIt->second.get());
         }
     }
     origin(pos);
 }
+
+// ====================== 插件生命周期 ======================
+namespace redstone_optimizer {
 
 PluginImpl& PluginImpl::getInstance() {
     static PluginImpl instance;
@@ -291,7 +264,6 @@ bool PluginImpl::enable() {
         ConsumerComponentEvaluateHook::hook();
         CircuitSceneGraphRemoveComponentHook::hook();
         hookInstalled = true;
-        logger().debug("Hooks installed");
     }
     if (config.debug) startDebugTask();
     logger().info("Plugin enabled");
@@ -306,9 +278,7 @@ bool PluginImpl::disable() {
         CircuitSceneGraphRemoveComponentHook::unhook();
         hookInstalled = false;
         clearCache();
-
         cacheHitCount = cacheMissCount = cacheSkipCount = 0;
-        logger().debug("Hooks uninstalled, cache cleared, counters reset");
     }
     logger().info("Plugin disabled");
     return true;
