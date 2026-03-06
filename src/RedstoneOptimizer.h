@@ -17,11 +17,11 @@ Config& getConfig();
 bool    loadConfig();
 bool    saveConfig();
 
-class ParallelRedstoneOptimizer {
+class RedstoneOptimizer {
 public:
-    static ParallelRedstoneOptimizer& getInstance();
+    static RedstoneOptimizer& getInstance();
 
-    ParallelRedstoneOptimizer() : mSelf(*ll::mod::NativeMod::current()) {}
+    RedstoneOptimizer() : mSelf(*ll::mod::NativeMod::current()) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
