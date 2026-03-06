@@ -11,6 +11,7 @@
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
 #include <mc/world/redstone/circuit/components/BaseCircuitComponent.h>
 #include <mc/world/redstone/circuit/components/ConsumerComponent.h>
+#include <mc/world/redstone/circuit/CircuitComponentList.h> // 新增，用于访问 mComponents
 #include <entt/entt.hpp>
 #include <filesystem>
 #include <chrono>
@@ -120,12 +121,12 @@ static std::pair<
     for (auto& pos : nodes) {
         auto* comp = graph.mAllComponents[pos].get();
         if (!comp) continue;
-        // 访问 mSources (BaseCircuitComponent 的成员)
-        auto& sources = comp->mSources;
-        for (auto& item : sources.mComponents) {
+        // 获取实际的 CircuitComponentList 对象
+        auto& sources = comp->mSources.get(); // 假设 mSources 是 TypedStorage，调用 get() 返回引用
+        for (auto& item : sources.mComponents) { // 假设 CircuitComponentList 有 mComponents 成员
             BaseCircuitComponent* srcComp = item.mComponent;
             if (!srcComp) continue;
-            BlockPos srcPos = srcComp->getPos();
+            BlockPos srcPos = srcComp->mPos.get(); // 直接访问成员 mPos，可能是 TypedStorage
             if (nodes.find(srcPos) == nodes.end()) continue;
             edges[srcPos].push_back(pos);
             inDegree[pos]++;
@@ -135,7 +136,7 @@ static std::pair<
     return {std::move(edges), std::move(inDegree)};
 }
 
-// 拓扑排序，返回层次列表（每层为一个节点集合），若存在环路则返回空，并填充环路节点
+// 拓扑排序，返回层次列表（每层为一个节点集合），若存在环路则返回空
 static std::vector<std::vector<BlockPos>> topologicalSort(
     const std::unordered_set<BlockPos>& nodes,
     const std::unordered_map<BlockPos, std::vector<BlockPos>>& edges,
@@ -214,10 +215,12 @@ static std::unordered_set<BlockPos> applyChanges(
         auto* comp = graph.mAllComponents[change.pos].get();
         if (!comp) continue;
         comp->setStrength(change.newStrength);
-        // 将其下游（mDestinations）加入新脏集合
-        for (auto* destComp : comp->mDestinations) {
+        // 获取 mDestinations 的实际对象并遍历
+        auto& destinations = comp->mDestinations.get(); // 假设 mDestinations 是 TypedStorage
+        // 假设 destinations 是某种可迭代容器，如 Core::RefCountedSet
+        for (auto* destComp : destinations) {
             if (destComp) {
-                newDirty.insert(destComp->getPos());
+                newDirty.insert(destComp->mPos.get());
             }
         }
     }
@@ -323,12 +326,12 @@ static void parallelRedstoneUpdate(CircuitSystem& system, BlockSource* region) {
 }
 
 // ==================== 钩子 ====================
-
+// 注意：使用 &CircuitSystem::evaluate 而非 $evaluate
 LL_AUTO_TYPE_INSTANCE_HOOK(
     CircuitSystemEvaluateHook,
     ll::memory::HookPriority::Normal,
     CircuitSystem,
-    &CircuitSystem::$evaluate,
+    &CircuitSystem::evaluate,
     void,
     BlockSource* region
 ) {
