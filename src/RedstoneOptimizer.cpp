@@ -11,7 +11,7 @@
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
 #include <mc/world/redstone/circuit/components/BaseCircuitComponent.h>
 #include <mc/world/redstone/circuit/components/ConsumerComponent.h>
-#include <mc/world/redstone/circuit/CircuitComponentList.h> // 新增，用于访问 mComponents
+#include <mc/world/redstone/circuit/components/CircuitComponentList.h>
 #include <entt/entt.hpp>
 #include <filesystem>
 #include <chrono>
@@ -122,11 +122,11 @@ static std::pair<
         auto* comp = graph.mAllComponents[pos].get();
         if (!comp) continue;
         // 获取实际的 CircuitComponentList 对象
-        auto& sources = comp->mSources.get(); // 假设 mSources 是 TypedStorage，调用 get() 返回引用
-        for (auto& item : sources.mComponents) { // 假设 CircuitComponentList 有 mComponents 成员
+        auto& sources = comp->mSources.get();
+        for (auto& item : sources.mComponents) {
             BaseCircuitComponent* srcComp = item.mComponent;
             if (!srcComp) continue;
-            BlockPos srcPos = srcComp->mPos.get(); // 直接访问成员 mPos，可能是 TypedStorage
+            BlockPos srcPos = srcComp->mPos.get();
             if (nodes.find(srcPos) == nodes.end()) continue;
             edges[srcPos].push_back(pos);
             inDegree[pos]++;
@@ -205,26 +205,17 @@ static std::vector<ComponentChange> processLayer(
     return changes;
 }
 
-// 应用变化到组件，并收集新的受影响节点
-static std::unordered_set<BlockPos> applyChanges(
+// 应用变化到组件（不尝试传播依赖，因为 mDestinations 不可用）
+static void applyChanges(
     CircuitSceneGraph& graph,
     const std::vector<ComponentChange>& changes
 ) {
-    std::unordered_set<BlockPos> newDirty;
     for (auto& change : changes) {
         auto* comp = graph.mAllComponents[change.pos].get();
         if (!comp) continue;
         comp->setStrength(change.newStrength);
-        // 获取 mDestinations 的实际对象并遍历
-        auto& destinations = comp->mDestinations.get(); // 假设 mDestinations 是 TypedStorage
-        // 假设 destinations 是某种可迭代容器，如 Core::RefCountedSet
-        for (auto* destComp : destinations) {
-            if (destComp) {
-                newDirty.insert(destComp->mPos.get());
-            }
-        }
+        // 注意：mDestinations 为空壳，无法遍历，依赖传播由原版其他机制维护
     }
-    return newDirty;
 }
 
 // 处理环路节点（串行迭代）
@@ -310,14 +301,11 @@ static void parallelRedstoneUpdate(CircuitSystem& system, BlockSource* region) {
         auto changes = processCycle(system, dirtyNodes, compMap, config.maxIterations);
         applyChanges(graph, changes);
     } else {
-        std::unordered_set<BlockPos> newlyDirty;
         for (auto& layer : layers) {
             auto changes = processLayer(system, layer, compMap);
             totalComponentsProcessed += layer.size();
-            auto newDirty = applyChanges(graph, changes);
-            newlyDirty.insert(newDirty.begin(), newDirty.end());
+            applyChanges(graph, changes);
         }
-        // 可在此将 newlyDirty 加入 mComponentsToReEvaluate（但原版可能已经做了）
         totalIterations++;
     }
 
@@ -326,12 +314,11 @@ static void parallelRedstoneUpdate(CircuitSystem& system, BlockSource* region) {
 }
 
 // ==================== 钩子 ====================
-// 注意：使用 &CircuitSystem::evaluate 而非 $evaluate
 LL_AUTO_TYPE_INSTANCE_HOOK(
     CircuitSystemEvaluateHook,
     ll::memory::HookPriority::Normal,
     CircuitSystem,
-    &CircuitSystem::evaluate,
+    &CircuitSystem::evaluate,   // 使用原版函数名，而非 $evaluate
     void,
     BlockSource* region
 ) {
