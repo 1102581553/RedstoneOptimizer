@@ -10,7 +10,6 @@
 #include <mc/world/redstone/circuit/CircuitSceneGraph.h>
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
 #include <mc/world/redstone/circuit/components/BaseCircuitComponent.h>
-#include <mc/world/redstone/circuit/components/ConsumerComponent.h>
 #include <mc/world/redstone/circuit/components/CircuitComponentList.h>
 #include <entt/entt.hpp>
 #include <filesystem>
@@ -29,9 +28,8 @@ namespace parallel_redstone {
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool debugTaskRunning = false;
-static std::mutex graphMutex; // 模拟 mLockGraph
+static std::mutex graphMutex;
 
-// 调试统计
 static std::atomic<size_t> totalComponentsProcessed{0};
 static std::atomic<size_t> totalTicks{0};
 static std::atomic<size_t> totalIterations{0};
@@ -87,41 +85,41 @@ static void stopDebugTask() {
     debugTaskRunning = false;
 }
 
-// ==================== 数据结构定义 ====================
 struct ComponentChange {
     BlockPos pos;
     int newStrength;
 };
 
-// 构建依赖图：输入需要更新的组件位置集合，输出有向边列表和入度表
 static std::pair<
     std::unordered_map<BlockPos, std::vector<BlockPos>>,
     std::unordered_map<BlockPos, int>
 > buildDependencyGraph(
     CircuitSceneGraph& graph,
-    const std::unordered_set<BlockPos>& nodes
+    const std::unordered_set<BlockPos>& nodes,
+    bool debug
 ) {
     std::unordered_map<BlockPos, std::vector<BlockPos>> edges;
     std::unordered_map<BlockPos, int> inDegree;
-    for (auto& pos : nodes) {
-        inDegree[pos] = 0;
-    }
+    for (auto& pos : nodes) inDegree[pos] = 0;
 
-    // 从 mComponentsToReEvaluate 获取依赖关系
+    size_t edgeCount = 0;
+
+    // 从 mComponentsToReEvaluate 获取依赖
     for (auto& [srcPos, deps] : graph.mComponentsToReEvaluate) {
         if (nodes.find(srcPos) == nodes.end()) continue;
         for (auto& depPos : deps) {
             if (nodes.find(depPos) == nodes.end()) continue;
             edges[srcPos].push_back(depPos);
             inDegree[depPos]++;
+            edgeCount++;
+            if (debug) logger().info("  Dep (mComponentsToReEvaluate): {} -> {}", srcPos.toNbt(), depPos.toNbt());
         }
     }
 
-    // 补充从 mSources 获取的依赖
+    // 从 mSources 获取反向依赖
     for (auto& pos : nodes) {
         auto* comp = graph.mAllComponents[pos].get();
         if (!comp) continue;
-        // 获取实际的 CircuitComponentList 对象
         auto& sources = comp->mSources.get();
         for (auto& item : sources.mComponents) {
             BaseCircuitComponent* srcComp = item.mComponent;
@@ -130,24 +128,23 @@ static std::pair<
             if (nodes.find(srcPos) == nodes.end()) continue;
             edges[srcPos].push_back(pos);
             inDegree[pos]++;
+            edgeCount++;
+            if (debug) logger().info("  Dep (mSources): {} -> {}", srcPos.toNbt(), pos.toNbt());
         }
     }
 
+    if (debug) logger().info("  Total edges added: {}", edgeCount);
     return {std::move(edges), std::move(inDegree)};
 }
 
-// 拓扑排序，返回层次列表（每层为一个节点集合），若存在环路则返回空
 static std::vector<std::vector<BlockPos>> topologicalSort(
     const std::unordered_set<BlockPos>& nodes,
     const std::unordered_map<BlockPos, std::vector<BlockPos>>& edges,
-    std::unordered_map<BlockPos, int>& inDegree
+    std::unordered_map<BlockPos, int>& inDegree,
+    bool debug
 ) {
     std::queue<BlockPos> q;
-    for (auto& pos : nodes) {
-        if (inDegree[pos] == 0) {
-            q.push(pos);
-        }
-    }
+    for (auto& pos : nodes) if (inDegree[pos] == 0) q.push(pos);
 
     std::vector<std::vector<BlockPos>> layers;
     std::unordered_set<BlockPos> visited;
@@ -161,36 +158,38 @@ static std::vector<std::vector<BlockPos>> topologicalSort(
             auto it = edges.find(u);
             if (it != edges.end()) {
                 for (auto& v : it->second) {
-                    if (--inDegree[v] == 0) {
-                        q.push(v);
-                    }
+                    if (--inDegree[v] == 0) q.push(v);
                 }
             }
         }
         layers.push_back(layer);
+        if (debug) logger().info("  Layer {} size: {}", layers.size(), layer.size());
     }
-
     if (visited.size() != nodes.size()) {
-        // 有环路
+        if (debug) logger().info("  Cycle detected: visited {}/{} nodes", visited.size(), nodes.size());
         return {};
     }
+    if (debug) logger().info("  Topological sort succeeded, total layers: {}", layers.size());
     return layers;
 }
 
-// 处理一层中的多个组件（并行）
 static std::vector<ComponentChange> processLayer(
     CircuitSystem& system,
     const std::vector<BlockPos>& layer,
-    std::unordered_map<BlockPos, BaseCircuitComponent*>& compMap
+    std::unordered_map<BlockPos, BaseCircuitComponent*>& compMap,
+    bool debug
 ) {
+    if (debug) logger().info("  Processing layer with {} components", layer.size());
     std::vector<std::future<std::optional<ComponentChange>>> futures;
     for (auto& pos : layer) {
         auto* comp = compMap[pos];
         if (!comp) continue;
-        futures.push_back(std::async(std::launch::async, [&system, comp, pos]() -> std::optional<ComponentChange> {
+        futures.push_back(std::async(std::launch::async, [&system, comp, pos, debug]() -> std::optional<ComponentChange> {
             bool changed = comp->evaluate(system, pos);
             if (changed) {
-                return ComponentChange{pos, comp->getStrength()};
+                int newStr = comp->getStrength();
+                if (debug) logger().info("    Component {} changed to strength {}", pos.toNbt(), newStr);
+                return ComponentChange{pos, newStr};
             }
             return std::nullopt;
         }));
@@ -198,40 +197,36 @@ static std::vector<ComponentChange> processLayer(
     std::vector<ComponentChange> changes;
     for (auto& f : futures) {
         auto opt = f.get();
-        if (opt.has_value()) {
-            changes.push_back(opt.value());
-        }
+        if (opt.has_value()) changes.push_back(opt.value());
     }
+    if (debug) logger().info("  Layer processed, {} changes", changes.size());
     return changes;
 }
 
-// 应用变化到组件（不尝试传播依赖，因为 mDestinations 不可用）
-static void applyChanges(
-    CircuitSceneGraph& graph,
-    const std::vector<ComponentChange>& changes
-) {
+static void applyChanges(CircuitSceneGraph& graph, const std::vector<ComponentChange>& changes, bool debug) {
     for (auto& change : changes) {
         auto* comp = graph.mAllComponents[change.pos].get();
-        if (!comp) continue;
-        comp->setStrength(change.newStrength);
-        // 注意：mDestinations 为空壳，无法遍历，依赖传播由原版其他机制维护
+        if (comp) {
+            comp->setStrength(change.newStrength);
+            if (debug) logger().info("    Applied change at {}", change.pos.toNbt());
+        }
     }
 }
 
-// 处理环路节点（串行迭代）
 static std::vector<ComponentChange> processCycle(
     CircuitSystem& system,
     const std::unordered_set<BlockPos>& cycleNodes,
     std::unordered_map<BlockPos, BaseCircuitComponent*>& compMap,
-    int maxIter
+    int maxIter,
+    bool debug
 ) {
     std::vector<BlockPos> sorted(cycleNodes.begin(), cycleNodes.end());
     std::sort(sorted.begin(), sorted.end());
 
+    if (debug) logger().info("  Processing cycle with {} nodes, max iterations {}", sorted.size(), maxIter);
+
     std::unordered_map<BlockPos, int> lastStrength;
-    for (auto& pos : sorted) {
-        lastStrength[pos] = compMap[pos]->getStrength();
-    }
+    for (auto& pos : sorted) lastStrength[pos] = compMap[pos]->getStrength();
 
     bool stable = false;
     int iter = 0;
@@ -247,67 +242,83 @@ static std::vector<ComponentChange> processCycle(
                     lastStrength[pos] = newStr;
                     allChanges.push_back({pos, newStr});
                     stable = false;
+                    if (debug) logger().info("    Iter {}: {} changed to {}", iter, pos.toNbt(), newStr);
                 }
             }
         }
         iter++;
     }
+    if (debug) logger().info("  Cycle processed in {} iterations, {} changes total", iter, allChanges.size());
     return allChanges;
 }
 
-// 主并行红石更新函数
 static void parallelRedstoneUpdate(CircuitSystem& system, BlockSource* region) {
+    auto start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(graphMutex);
 
     CircuitSceneGraph& graph = system.mSceneGraph;
 
     // 1. 处理待处理队列
     graph.processPendingAdds();
-    // 如果有 processPendingUpdates 和 processPendingRemoves，也应调用
+    // 如果有其他待处理队列，也应处理
 
-    // 2. 收集所有需要更新的节点
+    // 2. 收集脏节点
     std::unordered_set<BlockPos> dirtyNodes;
     for (auto& [srcPos, deps] : graph.mComponentsToReEvaluate) {
         dirtyNodes.insert(srcPos);
-        for (auto& depPos : deps) {
-            dirtyNodes.insert(depPos);
-        }
+        for (auto& depPos : deps) dirtyNodes.insert(depPos);
     }
 
+    auto endCollect = std::chrono::steady_clock::now();
+    auto collectUs = std::chrono::duration_cast<std::chrono::microseconds>(endCollect - start).count();
+
     if (dirtyNodes.empty()) {
+        logger().info("No dirty nodes, skipping parallel update");
         system.mHasBeenEvaluated = true;
         return;
     }
 
-    // 3. 构建节点到组件指针的映射
+    logger().info("Dirty nodes count: {}", dirtyNodes.size());
+
+    // 3. 构建映射
     std::unordered_map<BlockPos, BaseCircuitComponent*> compMap;
     for (auto& pos : dirtyNodes) {
         auto it = graph.mAllComponents.find(pos);
-        if (it != graph.mAllComponents.end()) {
-            compMap[pos] = it->second.get();
-        }
+        if (it != graph.mAllComponents.end()) compMap[pos] = it->second.get();
+        else logger().warn("Component at {} not found in mAllComponents", pos.toNbt());
     }
 
-    // 4. 构建依赖图
-    auto [edges, inDegree] = buildDependencyGraph(graph, dirtyNodes);
+    auto endMap = std::chrono::steady_clock::now();
+    auto mapUs = std::chrono::duration_cast<std::chrono::microseconds>(endMap - endCollect).count();
 
-    // 5. 拓扑排序分层
-    auto layers = topologicalSort(dirtyNodes, edges, inDegree);
+    // 4. 构建依赖图
+    bool debug = config.debug;
+    auto [edges, inDegree] = buildDependencyGraph(graph, dirtyNodes, debug);
+    auto layers = topologicalSort(dirtyNodes, edges, inDegree, debug);
     bool hasCycle = layers.empty();
+
+    auto endGraph = std::chrono::steady_clock::now();
+    auto graphUs = std::chrono::duration_cast<std::chrono::microseconds>(endGraph - endMap).count();
+
     if (hasCycle) {
-        if (config.debug) {
-            logger().warn("Cycle detected, processing {} nodes serially", dirtyNodes.size());
-        }
-        auto changes = processCycle(system, dirtyNodes, compMap, config.maxIterations);
-        applyChanges(graph, changes);
+        logger().info("Cycle detected, processing {} nodes serially", dirtyNodes.size());
+        auto changes = processCycle(system, dirtyNodes, compMap, config.maxIterations, debug);
+        applyChanges(graph, changes, debug);
+        totalComponentsProcessed += dirtyNodes.size();
     } else {
+        logger().info("Layers: {}", layers.size());
         for (auto& layer : layers) {
-            auto changes = processLayer(system, layer, compMap);
+            auto changes = processLayer(system, layer, compMap, debug);
             totalComponentsProcessed += layer.size();
-            applyChanges(graph, changes);
+            applyChanges(graph, changes, debug);
         }
         totalIterations++;
     }
+
+    auto end = std::chrono::steady_clock::now();
+    auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    logger().info("Parallel update completed: dirty={}, collect={}us, map={}us, graph={}us, total={}us",
+                  dirtyNodes.size(), collectUs, mapUs, graphUs, totalUs);
 
     system.mHasBeenEvaluated = true;
     totalTicks++;
@@ -318,15 +329,14 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     CircuitSystemEvaluateHook,
     ll::memory::HookPriority::Normal,
     CircuitSystem,
-    &CircuitSystem::evaluate,   // 使用原版函数名，而非 $evaluate
+    &CircuitSystem::evaluate,
     void,
     BlockSource* region
 ) {
     if (config.enabled) {
         parallelRedstoneUpdate(*this, region);
-        return;
     }
-    origin(region);
+    origin(region); // 始终调用原版确保红石工作
 }
 
 // ==================== 插件生命周期 ====================
