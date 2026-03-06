@@ -4,7 +4,6 @@
 #include <ll/api/io/Logger.h>
 #include <ll/api/io/LoggerRegistry.h>
 #include <ll/api/thread/ServerThreadExecutor.h>
-#include <ll/api/thread/ThreadPool.h>
 #include <ll/api/coro/CoroTask.h>
 #include <mc/world/level/Level.h>
 #include <mc/world/redstone/circuit/CircuitSystem.h>
@@ -29,7 +28,6 @@ namespace parallel_redstone {
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
 static bool debugTaskRunning = false;
-static std::unique_ptr<ll::thread::ThreadPool> threadPool;
 static std::mutex graphMutex; // 模拟 mLockGraph
 
 // 调试统计
@@ -188,7 +186,7 @@ static std::vector<ComponentChange> processLayer(
     for (auto& pos : layer) {
         auto* comp = compMap[pos];
         if (!comp) continue;
-        futures.push_back(threadPool->submit([&system, comp, pos]() -> std::optional<ComponentChange> {
+        futures.push_back(std::async(std::launch::async, [&system, comp, pos]() -> std::optional<ComponentChange> {
             bool changed = comp->evaluate(system, pos);
             if (changed) {
                 return ComponentChange{pos, comp->getStrength()};
@@ -360,13 +358,6 @@ bool RedstoneOptimizer::load() {
 }
 
 bool RedstoneOptimizer::enable() {
-    size_t threadCount = config.maxThreads;
-    if (threadCount == 0) {
-        threadCount = std::thread::hardware_concurrency();
-    }
-    threadPool = std::make_unique<ll::thread::ThreadPool>(threadCount);
-    logger().info("Thread pool created with {} threads", threadCount);
-
     if (config.debug) startDebugTask();
     logger().info("Plugin enabled");
     return true;
@@ -374,7 +365,6 @@ bool RedstoneOptimizer::enable() {
 
 bool RedstoneOptimizer::disable() {
     stopDebugTask();
-    threadPool.reset();
     resetStats();
     logger().info("Plugin disabled");
     return true;
