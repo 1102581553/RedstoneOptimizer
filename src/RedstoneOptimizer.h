@@ -10,7 +10,6 @@ struct Config {
     bool enabled = true;
     bool debug   = false;
     int  maxIterations = 10;        // 最大迭代次数，防止无限循环
-    int  maxThreads = 0;             // 0 表示自动检测
 };
 
 Config& getConfig();
