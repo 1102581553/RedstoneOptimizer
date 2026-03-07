@@ -1,62 +1,82 @@
 #include "RedstoneOptimizer.h"
 #include <ll/api/memory/Hook.h>
 #include <ll/api/mod/RegisterHelper.h>
-#include <ll/api/io/Logger.h>
+#include <ll/api/service/Bedrock.h>
 #include <ll/api/io/LoggerRegistry.h>
-#include <ll/api/thread/ServerThreadExecutor.h>
+#include <ll/api/chrono/GameChrono.h>
 #include <ll/api/coro/CoroTask.h>
+#include <ll/api/thread/ServerThreadExecutor.h>
 #include <mc/world/level/Level.h>
-#include <mc/world/redstone/circuit/CircuitSystem.h>
 #include <mc/world/redstone/circuit/CircuitSceneGraph.h>
 #include <mc/world/redstone/circuit/ChunkCircuitComponentList.h>
-#include <mc/world/redstone/circuit/components/BaseCircuitComponent.h>
-#include <mc/world/redstone/circuit/components/CircuitComponentList.h>
-#include <entt/entt.hpp>
-#include <filesystem>
-#include <chrono>
-#include <vector>
+#include <mc/world/redstone/circuit/components/ConsumerComponent.h>
 #include <algorithm>
-#include <unordered_map>
-#include <unordered_set>
-#include <queue>
-#include <mutex>
-#include <future>
+#include <filesystem>
+#include <shared_mutex>
 #include <atomic>
 
-namespace parallel_redstone {
+namespace redstone_optimizer {
 
 static Config config;
 static std::shared_ptr<ll::io::Logger> log;
+
+// 扁平缓存：无淘汰，只增不减
+static std::unordered_map<void*, CacheEntry> cacheMap;
+static std::shared_mutex cacheMapMutex;
+
+static bool hookInstalled = false;
 static bool debugTaskRunning = false;
-static std::mutex graphMutex;
 
-static std::atomic<size_t> totalComponentsProcessed{0};
-static std::atomic<size_t> totalTicks{0};
-static std::atomic<size_t> totalIterations{0};
+static std::atomic<size_t> cacheHitCount{0};
+static std::atomic<size_t> cacheMissCount{0};
+static std::atomic<size_t> cacheSkipCount{0};
 
-static ll::io::Logger& logger() {
+thread_local int evaluateDepth = 0;
+constexpr int MAX_EVALUATE_DEPTH = 512; // 可根据实际调整
+
+Config& getConfig() { return config; }
+
+void clearCache() {
+    std::unique_lock lock(cacheMapMutex);
+    cacheMap.clear();
+}
+
+bool loadConfig() {
+    auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
+    return ll::config::loadConfig(config, path);
+}
+
+bool saveConfig() {
+    auto path = PluginImpl::getInstance().getSelf().getConfigDir() / "config.json";
+    return ll::config::saveConfig(config, path);
+}
+
+ll::io::Logger& logger() {
     if (!log) {
         log = ll::io::LoggerRegistry::getInstance().getOrCreate("RedstoneOptimizer");
     }
     return *log;
 }
 
-Config& getConfig() { return config; }
+static uint64_t computeInputHash(ConsumerComponent* comp) {
+    if (!comp) return 0;
 
-bool loadConfig() {
-    auto path = RedstoneOptimizer::getInstance().getSelf().getConfigDir() / "config.json";
-    return ll::config::loadConfig(config, path);
-}
+    auto* sources = comp->mSources.operator->();
+    if (!sources) return 0;
 
-bool saveConfig() {
-    auto path = RedstoneOptimizer::getInstance().getSelf().getConfigDir() / "config.json";
-    return ll::config::saveConfig(config, path);
-}
+    uint64_t hash = 0;
+    for (const auto& item : sources->mComponents) {
+        BaseCircuitComponent* source = item.mComponent;
+        if (!source) continue;
 
-static void resetStats() {
-    totalComponentsProcessed = 0;
-    totalTicks = 0;
-    totalIterations = 0;
+        int strength = source->getStrength();
+        hash = hash * 131 + static_cast<uint64_t>(strength);
+        hash = hash * 131 + static_cast<uint64_t>(item.mDampening);
+        hash = hash * 131 + (item.mDirectlyPowered ? 1ULL : 0ULL);
+        hash = hash * 131 + static_cast<uint64_t>(item.mDirection);
+        hash = hash * 131 + static_cast<uint64_t>(item.mData);
+    }
+    return hash;
 }
 
 static void startDebugTask() {
@@ -68,13 +88,13 @@ static void startDebugTask() {
             co_await std::chrono::seconds(5);
             ll::thread::ServerThreadExecutor::getDefault().execute([] {
                 if (!config.debug) return;
-                size_t avgComp = totalTicks > 0 ? totalComponentsProcessed.load() / totalTicks.load() : 0;
-                size_t avgIter = totalTicks > 0 ? totalIterations.load() / totalTicks.load() : 0;
+                size_t total = cacheHitCount.load() + cacheMissCount.load();
+                double hitRate = total > 0 ? (100.0 * cacheHitCount.load() / total) : 0.0;
                 logger().info(
-                    "Redstone stats (5s): total components processed={}, avg per tick={}, avg iterations={}",
-                    totalComponentsProcessed.load(), avgComp, avgIter
+                    "Cache stats: hits={}, misses={}, skip={}, size={}, hitRate={:.1f}%",
+                    cacheHitCount.load(), cacheMissCount.load(), cacheSkipCount.load(),
+                    cacheMap.size(), hitRate
                 );
-                resetStats();
             });
         }
         debugTaskRunning = false;
@@ -85,291 +105,163 @@ static void stopDebugTask() {
     debugTaskRunning = false;
 }
 
-struct ComponentChange {
-    BlockPos pos;
-    int newStrength;
-};
+} // namespace redstone_optimizer
 
-static std::pair<
-    std::unordered_map<BlockPos, std::vector<BlockPos>>,
-    std::unordered_map<BlockPos, int>
-> buildDependencyGraph(
-    CircuitSceneGraph& graph,
-    const std::unordered_set<BlockPos>& nodes,
-    bool debug
-) {
-    std::unordered_map<BlockPos, std::vector<BlockPos>> edges;
-    std::unordered_map<BlockPos, int> inDegree;
-    for (auto& pos : nodes) inDegree[pos] = 0;
+// ====================== Hooks ======================
 
-    size_t edgeCount = 0;
-
-    // 从 mComponentsToReEvaluate 获取依赖
-    for (auto& [srcPos, deps] : graph.mComponentsToReEvaluate) {
-        if (nodes.find(srcPos) == nodes.end()) continue;
-        for (auto& depPos : deps) {
-            if (nodes.find(depPos) == nodes.end()) continue;
-            edges[srcPos].push_back(depPos);
-            inDegree[depPos]++;
-            edgeCount++;
-            if (debug) logger().info("  Dep (mComponentsToReEvaluate): {} -> {}", srcPos.toNbt(), depPos.toNbt());
-        }
-    }
-
-    // 从 mSources 获取反向依赖
-    for (auto& pos : nodes) {
-        auto* comp = graph.mAllComponents[pos].get();
-        if (!comp) continue;
-        auto& sources = comp->mSources.get();
-        for (auto& item : sources.mComponents) {
-            BaseCircuitComponent* srcComp = item.mComponent;
-            if (!srcComp) continue;
-            BlockPos srcPos = srcComp->mPos.get();
-            if (nodes.find(srcPos) == nodes.end()) continue;
-            edges[srcPos].push_back(pos);
-            inDegree[pos]++;
-            edgeCount++;
-            if (debug) logger().info("  Dep (mSources): {} -> {}", srcPos.toNbt(), pos.toNbt());
-        }
-    }
-
-    if (debug) logger().info("  Total edges added: {}", edgeCount);
-    return {std::move(edges), std::move(inDegree)};
-}
-
-static std::vector<std::vector<BlockPos>> topologicalSort(
-    const std::unordered_set<BlockPos>& nodes,
-    const std::unordered_map<BlockPos, std::vector<BlockPos>>& edges,
-    std::unordered_map<BlockPos, int>& inDegree,
-    bool debug
-) {
-    std::queue<BlockPos> q;
-    for (auto& pos : nodes) if (inDegree[pos] == 0) q.push(pos);
-
-    std::vector<std::vector<BlockPos>> layers;
-    std::unordered_set<BlockPos> visited;
-    while (!q.empty()) {
-        std::vector<BlockPos> layer;
-        size_t qsize = q.size();
-        for (size_t i = 0; i < qsize; ++i) {
-            BlockPos u = q.front(); q.pop();
-            layer.push_back(u);
-            visited.insert(u);
-            auto it = edges.find(u);
-            if (it != edges.end()) {
-                for (auto& v : it->second) {
-                    if (--inDegree[v] == 0) q.push(v);
-                }
-            }
-        }
-        layers.push_back(layer);
-        if (debug) logger().info("  Layer {} size: {}", layers.size(), layer.size());
-    }
-    if (visited.size() != nodes.size()) {
-        if (debug) logger().info("  Cycle detected: visited {}/{} nodes", visited.size(), nodes.size());
-        return {};
-    }
-    if (debug) logger().info("  Topological sort succeeded, total layers: {}", layers.size());
-    return layers;
-}
-
-static std::vector<ComponentChange> processLayer(
-    CircuitSystem& system,
-    const std::vector<BlockPos>& layer,
-    std::unordered_map<BlockPos, BaseCircuitComponent*>& compMap,
-    bool debug
-) {
-    if (debug) logger().info("  Processing layer with {} components", layer.size());
-    std::vector<std::future<std::optional<ComponentChange>>> futures;
-    for (auto& pos : layer) {
-        auto* comp = compMap[pos];
-        if (!comp) continue;
-        futures.push_back(std::async(std::launch::async, [&system, comp, pos, debug]() -> std::optional<ComponentChange> {
-            bool changed = comp->evaluate(system, pos);
-            if (changed) {
-                int newStr = comp->getStrength();
-                if (debug) logger().info("    Component {} changed to strength {}", pos.toNbt(), newStr);
-                return ComponentChange{pos, newStr};
-            }
-            return std::nullopt;
-        }));
-    }
-    std::vector<ComponentChange> changes;
-    for (auto& f : futures) {
-        auto opt = f.get();
-        if (opt.has_value()) changes.push_back(opt.value());
-    }
-    if (debug) logger().info("  Layer processed, {} changes", changes.size());
-    return changes;
-}
-
-static void applyChanges(CircuitSceneGraph& graph, const std::vector<ComponentChange>& changes, bool debug) {
-    for (auto& change : changes) {
-        auto* comp = graph.mAllComponents[change.pos].get();
-        if (comp) {
-            comp->setStrength(change.newStrength);
-            if (debug) logger().info("    Applied change at {}", change.pos.toNbt());
-        }
-    }
-}
-
-static std::vector<ComponentChange> processCycle(
-    CircuitSystem& system,
-    const std::unordered_set<BlockPos>& cycleNodes,
-    std::unordered_map<BlockPos, BaseCircuitComponent*>& compMap,
-    int maxIter,
-    bool debug
-) {
-    std::vector<BlockPos> sorted(cycleNodes.begin(), cycleNodes.end());
-    std::sort(sorted.begin(), sorted.end());
-
-    if (debug) logger().info("  Processing cycle with {} nodes, max iterations {}", sorted.size(), maxIter);
-
-    std::unordered_map<BlockPos, int> lastStrength;
-    for (auto& pos : sorted) lastStrength[pos] = compMap[pos]->getStrength();
-
-    bool stable = false;
-    int iter = 0;
-    std::vector<ComponentChange> allChanges;
-    while (!stable && iter < maxIter) {
-        stable = true;
-        for (auto& pos : sorted) {
-            auto* comp = compMap[pos];
-            bool changed = comp->evaluate(system, pos);
-            if (changed) {
-                int newStr = comp->getStrength();
-                if (newStr != lastStrength[pos]) {
-                    lastStrength[pos] = newStr;
-                    allChanges.push_back({pos, newStr});
-                    stable = false;
-                    if (debug) logger().info("    Iter {}: {} changed to {}", iter, pos.toNbt(), newStr);
-                }
-            }
-        }
-        iter++;
-    }
-    if (debug) logger().info("  Cycle processed in {} iterations, {} changes total", iter, allChanges.size());
-    return allChanges;
-}
-
-static void parallelRedstoneUpdate(CircuitSystem& system, BlockSource* region) {
-    auto start = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(graphMutex);
-
-    CircuitSceneGraph& graph = system.mSceneGraph;
-
-    // 1. 处理待处理队列
-    graph.processPendingAdds();
-    // 如果有其他待处理队列，也应处理
-
-    // 2. 收集脏节点
-    std::unordered_set<BlockPos> dirtyNodes;
-    for (auto& [srcPos, deps] : graph.mComponentsToReEvaluate) {
-        dirtyNodes.insert(srcPos);
-        for (auto& depPos : deps) dirtyNodes.insert(depPos);
-    }
-
-    auto endCollect = std::chrono::steady_clock::now();
-    auto collectUs = std::chrono::duration_cast<std::chrono::microseconds>(endCollect - start).count();
-
-    if (dirtyNodes.empty()) {
-        logger().info("No dirty nodes, skipping parallel update");
-        system.mHasBeenEvaluated = true;
-        return;
-    }
-
-    logger().info("Dirty nodes count: {}", dirtyNodes.size());
-
-    // 3. 构建映射
-    std::unordered_map<BlockPos, BaseCircuitComponent*> compMap;
-    for (auto& pos : dirtyNodes) {
-        auto it = graph.mAllComponents.find(pos);
-        if (it != graph.mAllComponents.end()) compMap[pos] = it->second.get();
-        else logger().warn("Component at {} not found in mAllComponents", pos.toNbt());
-    }
-
-    auto endMap = std::chrono::steady_clock::now();
-    auto mapUs = std::chrono::duration_cast<std::chrono::microseconds>(endMap - endCollect).count();
-
-    // 4. 构建依赖图
-    bool debug = config.debug;
-    auto [edges, inDegree] = buildDependencyGraph(graph, dirtyNodes, debug);
-    auto layers = topologicalSort(dirtyNodes, edges, inDegree, debug);
-    bool hasCycle = layers.empty();
-
-    auto endGraph = std::chrono::steady_clock::now();
-    auto graphUs = std::chrono::duration_cast<std::chrono::microseconds>(endGraph - endMap).count();
-
-    if (hasCycle) {
-        logger().info("Cycle detected, processing {} nodes serially", dirtyNodes.size());
-        auto changes = processCycle(system, dirtyNodes, compMap, config.maxIterations, debug);
-        applyChanges(graph, changes, debug);
-        totalComponentsProcessed += dirtyNodes.size();
-    } else {
-        logger().info("Layers: {}", layers.size());
-        for (auto& layer : layers) {
-            auto changes = processLayer(system, layer, compMap, debug);
-            totalComponentsProcessed += layer.size();
-            applyChanges(graph, changes, debug);
-        }
-        totalIterations++;
-    }
-
-    auto end = std::chrono::steady_clock::now();
-    auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    logger().info("Parallel update completed: dirty={}, collect={}us, map={}us, graph={}us, total={}us",
-                  dirtyNodes.size(), collectUs, mapUs, graphUs, totalUs);
-
-    system.mHasBeenEvaluated = true;
-    totalTicks++;
-}
-
-// ==================== 钩子 ====================
-LL_AUTO_TYPE_INSTANCE_HOOK(
-    CircuitSystemEvaluateHook,
+LL_TYPE_INSTANCE_HOOK(
+    CircuitSceneGraphAddHook,
     ll::memory::HookPriority::Normal,
-    CircuitSystem,
-    &CircuitSystem::evaluate,
+    CircuitSceneGraph,
+    &CircuitSceneGraph::add,
     void,
-    BlockSource* region
+    BlockPos const& pos,
+    std::unique_ptr<BaseCircuitComponent> component
 ) {
-    if (config.enabled) {
-        parallelRedstoneUpdate(*this, region);
+    origin(pos, std::move(component));
+    if (!redstone_optimizer::config.enabled) return;
+
+    ChunkPos chunkPos(pos);
+    BlockPos chunkBlockPos(chunkPos.x, 0, chunkPos.z);
+    auto& chunkList = this->mActiveComponentsPerChunk[chunkBlockPos];
+
+    auto* pCompVec = chunkList.mComponents.operator->();
+    if (pCompVec && pCompVec->size() > 1) {
+        auto cmp = [](const ChunkCircuitComponentList::Item& a,
+                      const ChunkCircuitComponentList::Item& b) {
+            if (a.mPos->x != b.mPos->x) return a.mPos->x < b.mPos->x;
+            if (a.mPos->z != b.mPos->z) return a.mPos->z < b.mPos->z;
+            return a.mPos->y < b.mPos->y;
+        };
+        for (size_t i = pCompVec->size() - 1; i > 0; --i) {
+            if (cmp((*pCompVec)[i], (*pCompVec)[i - 1])) {
+                std::swap((*pCompVec)[i], (*pCompVec)[i - 1]);
+            } else {
+                break;
+            }
+        }
     }
-    origin(region); // 始终调用原版确保红石工作
+    chunkList.bShouldEvaluate = true;
 }
 
-// ==================== 插件生命周期 ====================
+LL_TYPE_INSTANCE_HOOK(
+    ConsumerComponentEvaluateHook,
+    ll::memory::HookPriority::Normal,
+    ConsumerComponent,
+    &ConsumerComponent::$evaluate,
+    bool,
+    CircuitSystem& system,
+    BlockPos const& pos
+) {
+    using namespace redstone_optimizer;
 
-RedstoneOptimizer& RedstoneOptimizer::getInstance() {
-    static RedstoneOptimizer instance;
+    ++evaluateDepth;
+    if (evaluateDepth > MAX_EVALUATE_DEPTH || !config.enabled) {
+        if (config.enabled) ++cacheSkipCount;
+        bool result = origin(system, pos);
+        --evaluateDepth;
+        return result;
+    }
+
+    uint64_t currentHash = computeInputHash(this);
+    void* key = this;
+
+    // 读缓存（共享锁）
+    {
+        std::shared_lock lock(cacheMapMutex);
+        auto it = cacheMap.find(key);
+        if (it != cacheMap.end() && it->second.inputHash == currentHash) {
+            int oldStrength = this->getStrength();
+            int cachedStrength = it->second.lastOutputStrength;
+            ++cacheHitCount;
+            --evaluateDepth;
+            if (oldStrength != cachedStrength) {
+                this->setStrength(cachedStrength);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    bool result = origin(system, pos);
+
+    // 写缓存（独占锁），无淘汰
+    {
+        std::unique_lock lock(cacheMapMutex);
+        cacheMap[key] = CacheEntry{
+            .inputHash = currentHash,
+            .lastOutputStrength = this->getStrength()
+        };
+    }
+
+    ++cacheMissCount;
+    --evaluateDepth;
+    return result;
+}
+
+LL_TYPE_INSTANCE_HOOK(
+    CircuitSceneGraphRemoveComponentHook,
+    ll::memory::HookPriority::Normal,
+    CircuitSceneGraph,
+    &CircuitSceneGraph::removeComponent,
+    void,
+    BlockPos const& pos
+) {
+    if (redstone_optimizer::config.enabled) {
+        auto compIt = this->mAllComponents.find(pos);
+        if (compIt != this->mAllComponents.end()) {
+            std::unique_lock lock(redstone_optimizer::cacheMapMutex);
+            redstone_optimizer::cacheMap.erase(compIt->second.get());
+        }
+    }
+    origin(pos);
+}
+
+namespace redstone_optimizer {
+
+PluginImpl& PluginImpl::getInstance() {
+    static PluginImpl instance;
     return instance;
 }
 
-bool RedstoneOptimizer::load() {
+bool PluginImpl::load() {
     std::filesystem::create_directories(getSelf().getConfigDir());
     if (!loadConfig()) {
         logger().warn("Failed to load config, using default values and saving");
         saveConfig();
     }
-    logger().info("Plugin loaded. enabled={}, debug={}, maxIterations={}",
-                  config.enabled, config.debug, config.maxIterations);
+    logger().info("Plugin loaded. enabled: {}, debug: {}", config.enabled, config.debug);
     return true;
 }
 
-bool RedstoneOptimizer::enable() {
+bool PluginImpl::enable() {
+    if (!hookInstalled) {
+        CircuitSceneGraphAddHook::hook();
+        ConsumerComponentEvaluateHook::hook();
+        CircuitSceneGraphRemoveComponentHook::hook();
+        hookInstalled = true;
+    }
     if (config.debug) startDebugTask();
     logger().info("Plugin enabled");
     return true;
 }
 
-bool RedstoneOptimizer::disable() {
+bool PluginImpl::disable() {
     stopDebugTask();
-    resetStats();
+    if (hookInstalled) {
+        CircuitSceneGraphAddHook::unhook();
+        ConsumerComponentEvaluateHook::unhook();
+        CircuitSceneGraphRemoveComponentHook::unhook();
+        hookInstalled = false;
+        clearCache();
+        cacheHitCount = 0;
+        cacheMissCount = 0;
+        cacheSkipCount = 0;
+    }
     logger().info("Plugin disabled");
     return true;
 }
 
-} // namespace parallel_redstone
+} // namespace redstone_optimizer
 
-LL_REGISTER_MOD(parallel_redstone::RedstoneOptimizer, parallel_redstone::RedstoneOptimizer::getInstance());
+LL_REGISTER_MOD(redstone_optimizer::PluginImpl, redstone_optimizer::PluginImpl::getInstance());
