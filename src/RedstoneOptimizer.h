@@ -1,26 +1,36 @@
 #pragma once
 #include <ll/api/Config.h>
+#include <ll/api/io/Logger.h>
 #include <ll/api/mod/NativeMod.h>
 #include <memory>
 
-namespace parallel_redstone {
+namespace redstone_optimizer {
+
+struct CacheEntry {
+    uint64_t inputHash;
+    int lastOutputStrength;
+};
 
 struct Config {
-    int  version = 1;
+    int version = 1;
     bool enabled = true;
-    bool debug   = false;
-    int  maxIterations = 10;        // 最大迭代次数，防止无限循环
+    bool debug = false;
+    // maxCacheSize 已移除，缓存不再限制大小
 };
 
 Config& getConfig();
-bool    loadConfig();
-bool    saveConfig();
+bool loadConfig();
+bool saveConfig();
 
-class RedstoneOptimizer {
+void clearCache();
+
+ll::io::Logger& logger();
+
+class PluginImpl {
 public:
-    static RedstoneOptimizer& getInstance();
+    static PluginImpl& getInstance();
 
-    RedstoneOptimizer() : mSelf(*ll::mod::NativeMod::current()) {}
+    PluginImpl() : mSelf(*ll::mod::NativeMod::current()) {}
 
     [[nodiscard]] ll::mod::NativeMod& getSelf() const { return mSelf; }
 
@@ -32,4 +42,4 @@ private:
     ll::mod::NativeMod& mSelf;
 };
 
-} // namespace parallel_redstone
+} // namespace redstone_optimizer
